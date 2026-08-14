@@ -209,5 +209,73 @@ class TestOmpDelegateAdmission(unittest.TestCase):
             self.assertIn("exit code: 0", result.lower())
 
 
+class TestRepositoryContainment(TestOmpDelegateAdmission):
+    """The repository key is a capability boundary, so the refusals need proving.
+
+    `_handle` rejects anything outside `ALLOWED_REPOS`, but until now only the accepting
+    path was exercised. The schema `enum` is advisory — a model can send any string, and a
+    tool whose containment is asserted nowhere is a boundary held by inspection alone.
+
+    Each case asserts the writer never ran, not merely that the reply says no.
+    """
+
+    def _attempt(self, repo: Path, invoke: Path, requested: str) -> str:
+        with (
+            mock.patch.object(self.module, "ALLOWED_REPOS", {"fixture": str(repo)}),
+            mock.patch.object(self.module, "INVOKE", str(invoke)),
+        ):
+            return self.module._handle(
+                {"repo": requested, "brief": BRIEF, "task_id": "fixture-task"}
+            )
+
+    def _refuses(self, requested: str, *, expect: str = "unknown repo") -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, seed, marker = self._fixture(root, committed=True)
+            invoke = root / "fake-invoke.py"
+
+            result = self._attempt(repo, invoke, requested)
+
+            self.assertFalse(marker.exists(), f"writer ran for repo={requested!r}")
+            self.assertEqual("baseline\n", seed.read_text(), "repository was modified")
+            self.assertIn(expect, result.lower())
+
+    def test_a_key_outside_the_policy_is_refused(self) -> None:
+        self._refuses("some-other-project")
+
+    def test_an_absolute_path_is_not_accepted_as_a_key(self) -> None:
+        self._refuses("/etc")
+
+    def test_a_traversal_key_is_refused(self) -> None:
+        self._refuses("../fixture")
+
+    def test_an_empty_key_is_refused(self) -> None:
+        self._refuses("")
+
+    def test_the_refusal_names_the_permitted_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, _seed, _marker = self._fixture(root, committed=True)
+            result = self._attempt(repo, root / "fake-invoke.py", "some-other-project")
+            self.assertIn("fixture", result)
+            self.assertIn("paths are not accepted", result.lower())
+
+    def test_a_missing_task_id_stops_the_writer(self) -> None:
+        """Correlation is what ties a delegated run to the ledger entry that authorised it."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, seed, marker = self._fixture(root, committed=True)
+            invoke = root / "fake-invoke.py"
+            with (
+                mock.patch.object(self.module, "ALLOWED_REPOS", {"fixture": str(repo)}),
+                mock.patch.object(self.module, "INVOKE", str(invoke)),
+            ):
+                result = self.module._handle({"repo": "fixture", "brief": BRIEF})
+
+            self.assertFalse(marker.exists(), "writer ran without a task id")
+            self.assertEqual("baseline\n", seed.read_text())
+            self.assertIn("task_id", result)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
