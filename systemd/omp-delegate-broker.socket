@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes to OMP delegation broker socket
+
+[Socket]
+ListenStream=%t/hermes-omp-broker/omp.sock
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

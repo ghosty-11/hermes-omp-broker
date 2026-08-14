@@ -1,0 +1,18 @@
+[Unit]
+Description=Hermes to OMP delegation broker
+Requires=omp-delegate-broker.socket
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hermes-omp-broker/environment
+ExecStart=/usr/bin/python3 %h/.local/libexec/hermes-omp-broker/omp-delegate-broker.py
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+KillMode=control-group
+TimeoutStopSec=15
+UMask=0077
+
+[Install]
+WantedBy=default.target

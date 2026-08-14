@@ -1,0 +1,10 @@
+name: hermes-omp-delegate
+label: Hermes to OMP delegation
+kind: standalone
+version: 0.1.0
+description: >
+  Registers one narrow delegate_to_omp tool. Repository keys, paths, model roles,
+  sandboxes, timeouts, and verification policy are server-owned; callers supply only
+  task correlation and a bounded implementation brief.
+provides_tools: [delegate_to_omp]
+author: ghosty-11

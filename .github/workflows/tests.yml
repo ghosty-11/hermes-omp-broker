@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Run deterministic suite
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Validate JSON files
+        run: |
+          python3 -m json.tool schemas/coding-job.schema.json >/dev/null
+          python3 -m json.tool examples/policy.json >/dev/null
+
+      - name: Compile Python sources
+        run: python3 -m compileall -q broker client plugin

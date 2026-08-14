@@ -1,0 +1,1 @@
+{"version":1,"socket":"run/omp-broker.sock","model":"provider/model","repositories":{"example":{"path":"repositories/example"}},"callers":{"delegate_to_omp":{"repositories":["example"],"sandbox":"workspace-write","read_paths":[],"write_patterns":[],"git_mode":"none","skills":[]}}}

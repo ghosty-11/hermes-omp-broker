@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ghosty-11/hermes-omp-broker/main/schemas/coding-job.schema.json",
+  "title": "Hermes to OMP broker wire protocol",
+  "description": "Protocol v1 request and response frames. Authentication and repository, caller, model, sandbox, timeout, path, tool, and credential authorization remain server-owned policy.",
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" }
+  ],
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "request_id",
+        "task_id",
+        "repository",
+        "caller",
+        "workspace",
+        "sandbox",
+        "model",
+        "prompt",
+        "timeout"
+      ],
+      "properties": {
+        "version": { "const": 1 },
+        "request_id": { "$ref": "#/$defs/id" },
+        "task_id": { "$ref": "#/$defs/id" },
+        "repository": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "description": "Server-owned allowlist key, never a filesystem path."
+        },
+        "caller": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "workspace": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "sandbox": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "model": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "prompt": { "type": "string", "minLength": 1, "maxLength": 500000 },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 810
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "exit_code",
+        "stdout",
+        "stderr",
+        "timed_out",
+        "process_group_clear",
+        "final",
+        "request_id"
+      ],
+      "properties": {
+        "version": { "const": 1 },
+        "exit_code": { "type": "integer" },
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" },
+        "timed_out": { "type": "boolean" },
+        "process_group_clear": { "type": "boolean" },
+        "final": {
+          "oneOf": [
+            { "$ref": "#/$defs/final" },
+            { "type": "null" }
+          ]
+        },
+        "request_id": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "final": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "verification", "gaps", "verdict"],
+      "properties": {
+        "summary": { "type": "string", "minLength": 1 },
+        "verification": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "gaps": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "verdict": {
+          "enum": ["MET", "PARTIALLY MET", "NOT MET"]
+        }
+      }
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+    }
+  }
+}
