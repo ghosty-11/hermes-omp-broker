@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -81,7 +82,7 @@ class TestOmpDelegateAdmission(unittest.TestCase):
                 {"repo": "fixture", "brief": BRIEF, "task_id": "fixture-task"}
             )
 
-    def test_availability_requires_the_client_and_broker_socket(self) -> None:
+    def test_availability_requires_the_client_and_a_connectable_broker_socket(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             invoke = root / "omp-invoke.py"
@@ -92,9 +93,66 @@ class TestOmpDelegateAdmission(unittest.TestCase):
                 mock.patch.object(self.module, "INVOKE", str(invoke)),
                 mock.patch.object(self.module, "BROKER_SOCKET", str(broker_socket)),
             ):
-                self.assertFalse(self.module._available())
+                self.assertFalse(
+                    self.module._available(),
+                    "advertised delegation with no socket present",
+                )
+
                 broker_socket.touch()
+                self.assertFalse(
+                    self.module._available(),
+                    "a regular file at the socket path advertised a broker that cannot accept",
+                )
+                broker_socket.unlink()
+
+                stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.addCleanup(stale.close)
+                stale.bind(str(broker_socket))
+                self.assertFalse(
+                    self.module._available(),
+                    "a bound but unlistening socket advertised a broker that cannot accept",
+                )
+                stale.close()
+                broker_socket.unlink()
+
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.addCleanup(listener.close)
+                listener.bind(str(broker_socket))
+                listener.listen(1)
+                self.assertTrue(
+                    self.module._available(),
+                    "refused delegation while a real broker was listening",
+                )
+
+    def test_availability_probe_leaves_the_broker_unmutated(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            invoke = root / "omp-invoke.py"
+            broker_socket = root / "omp.sock"
+            invoke.write_text("#!/bin/sh\n")
+            invoke.chmod(0o755)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(listener.close)
+            listener.bind(str(broker_socket))
+            listener.listen(1)
+            listener.settimeout(5)
+            with (
+                mock.patch.object(self.module, "INVOKE", str(invoke)),
+                mock.patch.object(self.module, "BROKER_SOCKET", str(broker_socket)),
+            ):
                 self.assertTrue(self.module._available())
+
+            try:
+                accepted, _ = listener.accept()
+            except socket.timeout:
+                self.fail("the probe never connected, so availability was not proven")
+            self.addCleanup(accepted.close)
+            accepted.settimeout(5)
+            self.assertEqual(
+                b"",
+                accepted.recv(64),
+                "the probe sent request bytes instead of closing immediately",
+            )
 
     def test_dirty_repository_is_refused_before_the_writer_runs(self) -> None:
         with tempfile.TemporaryDirectory() as td:

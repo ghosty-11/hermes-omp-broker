@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
+import stat
 import subprocess
 from typing import Any
 
@@ -62,13 +64,37 @@ TIMEOUT_S = 780
 BRIEF_MIN_CHARS = 60
 BRIEF_MAX_CHARS = 8000
 OUTPUT_MAX_CHARS = 4000
+BROKER_PROBE_TIMEOUT_S = 2.0
+
+
+def _broker_reachable(path: str) -> bool:
+    """A socket that cannot accept must never advertise the tool.
+
+    Existence is not availability: a stale or unrelated file at the socket path would
+    offer a delegating agent its only write path and then fail at call time. The probe
+    connects and closes without sending a frame, so the broker records no job.
+    """
+    try:
+        if not stat.S_ISSOCK(os.stat(path).st_mode):
+            return False
+    except OSError:
+        return False
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(BROKER_PROBE_TIMEOUT_S)
+        probe.connect(path)
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
 
 
 def _available() -> bool:
     return (
         os.path.isfile(INVOKE)
         and os.access(INVOKE, os.X_OK)
-        and os.path.exists(BROKER_SOCKET)
+        and _broker_reachable(BROKER_SOCKET)
     )
 
 
