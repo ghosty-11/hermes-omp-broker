@@ -236,8 +236,30 @@ def omp_environment(
     }
 
 
+def _fallback_models() -> tuple[str, ...]:
+    """Fixed extra rungs the child may retry on, as broker policy.
+
+    Read from the environment the unit owns, never from the request: a caller that
+    could name a fallback could name a provider whose credential it wanted minted.
+    """
+    raw = os.environ.get("HERMES_OMP_FALLBACK_MODELS", "")
+    return tuple(value for value in (part.strip() for part in raw.split(",")) if value)
+
+
+FALLBACK_MODELS = _fallback_models()
+
+
+def credential_providers(request: Request) -> tuple[str, ...]:
+    """The pinned model's provider first, then each fixed fallback rung's, deduplicated."""
+    providers = [request.model.partition("/")[0]]
+    for model in FALLBACK_MODELS:
+        provider = model.partition("/")[0]
+        if provider and provider not in providers:
+            providers.append(provider)
+    return tuple(providers)
+
+
 def resolve_provider_api_keys(request: Request) -> dict[str, str]:
-    provider = request.model.partition("/")[0]
     env = {
         "HOME": os.environ.get("HERMES_OMP_HOME", str(Path.home())),
         "PATH": os.environ.get("HERMES_OMP_PATH", os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")),
@@ -245,29 +267,32 @@ def resolve_provider_api_keys(request: Request) -> dict[str, str]:
         "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
         "PI_CODING_AGENT_DIR": str(OMP_CREDENTIAL_AGENT_DIR),
     }
-    try:
-        completed = subprocess.run(
-            [str(OMP_TOKEN_BIN), "token", provider, "--raw"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=30,
-            env=env,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ProtocolError("pinned OMP provider credential could not be resolved") from exc
-    value = completed.stdout.rstrip(b"\r\n")
-    if (
-        completed.returncode != 0
-        or not value
-        or len(value) > MAX_REQUEST_BYTES
-        or b"\x00" in value
-    ):
-        raise ProtocolError("pinned OMP provider credential is unavailable")
-    try:
-        return {provider: value.decode()}
-    except UnicodeDecodeError as exc:
-        raise ProtocolError("pinned OMP provider credential has invalid encoding") from exc
+    resolved: dict[str, str] = {}
+    for provider in credential_providers(request):
+        try:
+            completed = subprocess.run(
+                [str(OMP_TOKEN_BIN), "token", provider, "--raw"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=30,
+                env=env,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProtocolError("pinned OMP provider credential could not be resolved") from exc
+        value = completed.stdout.rstrip(b"\r\n")
+        if (
+            completed.returncode != 0
+            or not value
+            or len(value) > MAX_REQUEST_BYTES
+            or b"\x00" in value
+        ):
+            raise ProtocolError("pinned OMP provider credential is unavailable")
+        try:
+            resolved[provider] = value.decode()
+        except UnicodeDecodeError as exc:
+            raise ProtocolError("pinned OMP provider credential has invalid encoding") from exc
+    return resolved
 
 
 def start_omp_process(

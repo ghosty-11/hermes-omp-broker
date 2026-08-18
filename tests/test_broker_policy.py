@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -130,6 +131,55 @@ class BrokerPolicyTest(unittest.TestCase):
                 "a builtin allowlist hides trusted-extension tools before registration",
             )
             self.assertIn("--trusted-extension", argv)
+
+    def test_fixed_fallback_providers_also_receive_credentials(self) -> None:
+        """A fallback chain the child cannot authenticate is not a fallback.
+
+        OMP resolves `retry.fallbackChains` inside the child, so a rung on a second
+        provider fails at auth unless the broker injected that provider's key too.
+        The set is broker policy, never caller input: the request still carries only
+        the pinned primary model.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            policy = Path(td) / "policy.json"
+            policy.write_text(json.dumps({
+                "repositories": {"repo": {"path": td}},
+                "callers": {
+                    "delegate_to_omp": {
+                        "repositories": ["repo"],
+                        "sandbox": "workspace-write",
+                    }
+                },
+            }))
+            with mock.patch.dict(os.environ, {
+                "HERMES_OMP_POLICY": str(policy),
+                "HERMES_OMP_JOB_DIR": str(Path(td) / "jobs"),
+                "HERMES_OMP_MODEL": "hetzner/Qwen/Qwen3.6-35B-A3B-FP8",
+                "HERMES_OMP_FALLBACK_MODELS": "openai-codex/gpt-5.6-luna",
+            }):
+                spec = importlib.util.spec_from_file_location("broker_fallback", BROKER)
+                assert spec and spec.loader
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+            request = module.Request(
+                "req", "task", "repo", "delegate_to_omp", Path(td),
+                "workspace-write", "hetzner/Qwen/Qwen3.6-35B-A3B-FP8", "bounded", 10,
+                (), (), "none", (), False,
+            )
+            self.assertEqual(("hetzner", "openai-codex"), module.credential_providers(request))
+            calls: list[str] = []
+
+            def fake_run(argv, **_kwargs):
+                calls.append(argv[2])
+                return subprocess.CompletedProcess(argv, 0, f"key-{argv[2]}".encode(), b"")
+
+            with mock.patch.object(module.subprocess, "run", fake_run):
+                resolved = module.resolve_provider_api_keys(request)
+            self.assertEqual(["hetzner", "openai-codex"], calls)
+            self.assertEqual(
+                {"hetzner": "key-hetzner", "openai-codex": "key-openai-codex"}, resolved,
+            )
 
 
 if __name__ == "__main__":
