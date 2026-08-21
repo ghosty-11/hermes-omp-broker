@@ -75,6 +75,22 @@ class BrokerPolicyTest(unittest.TestCase):
                 wt.resolve(),
                 module.validate_request(request, peer_uid=os.getuid()).workspace)
 
+    def test_git_identity_probe_trusts_only_the_exact_candidate_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            policy = root / "policy.json"
+            policy.write_text(json.dumps({"repositories": {}}))
+            module = self._load_broker(policy, root / "jobs")
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{root}\n", stderr="")
+            with mock.patch.object(module.subprocess, "run", return_value=completed) as run:
+                self.assertEqual(root, module.git_toplevel(root))
+            command = run.call_args.args[0]
+            self.assertEqual(
+                ["git", "-c", f"safe.directory={root}", "-C", str(root)],
+                command[:5],
+            )
+
     def test_a_nested_directory_of_the_checkout_is_not_a_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

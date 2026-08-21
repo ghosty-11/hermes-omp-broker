@@ -155,7 +155,8 @@ def git_common_dir(path: Path) -> Path | None:
     """The shared .git of a checkout or worktree, or None if it is not git."""
     try:
         result = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--git-common-dir"],
+            ["git", "-c", f"safe.directory={path.resolve()}", "-C", str(path),
+             "rev-parse", "--git-common-dir"],
             capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -173,7 +174,8 @@ def git_common_dir(path: Path) -> Path | None:
 def git_toplevel(path: Path) -> Path | None:
     try:
         result = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            ["git", "-c", f"safe.directory={path.resolve()}", "-C", str(path),
+             "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
