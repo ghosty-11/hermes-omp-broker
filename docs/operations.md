@@ -44,8 +44,11 @@ control should confirm the recorded process group is gone before cleanup.
 
 Disable the Hermes tool and stop the socket/service. Restore the previous pinned
 client/broker/extension/plugin/skill/unit bytes plus the compatible policy and environment.
-Do not roll job state backward over newer records; retain the pre-rollback copy for
-reconciliation. Run:
+A policy that lists `fallback_models` or admits `backlog-maturation-research` is not
+compatible with a broker or extension from before those fields. Restore the matching
+policy with the matching bytes; do not leave a research caller pointed at an older
+extension. Do not roll job state backward over newer records; retain the pre-rollback
+copy for reconciliation. Run:
 
 ```sh
 systemctl --user daemon-reload
@@ -56,3 +59,4 @@ systemctl --user status omp-delegate-broker.socket
 Repeat admission denial and one bounded disposable-repository smoke before re-enabling the
 Hermes tool. Publication, repository deletion, credential changes, and history rewriting
 remain separate operator-authorized actions.
+

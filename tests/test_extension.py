@@ -53,6 +53,7 @@ console.log(JSON.stringify(output));''')
                 "OMP_DELEGATE_WRITE_PATTERNS": json.dumps(write_patterns or []),
                 "OMP_DELEGATE_GIT_MODE": git_mode,
                 "OMP_DELEGATE_CREATE_ONLY": "1" if create_only else "0",
+                "OMP_DELEGATE_CALLER": "",
             }
             result = subprocess.run(["node", str(runner)], env=env, text=True, capture_output=True, check=False)
         self.assertEqual(0, result.returncode, result.stderr)

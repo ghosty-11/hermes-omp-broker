@@ -23,6 +23,7 @@ RESPONSE_FIELDS = {
     "process_group_clear", "final", "request_id",
 }
 FINAL_FIELDS = {"summary", "verification", "gaps", "verdict"}
+OPTIONAL_FINAL_FIELDS = {"served_model"}
 FINAL_VERDICTS = {"MET", "PARTIALLY MET", "NOT MET"}
 
 
@@ -238,7 +239,10 @@ def _recv_exact(conn: socket.socket, size: int) -> bytes:
 
 
 def _valid_final(value: object) -> bool:
-    if not isinstance(value, dict) or set(value) != FINAL_FIELDS:
+    if not isinstance(value, dict):
+        return False
+    keys = set(value)
+    if not FINAL_FIELDS <= keys or not keys <= FINAL_FIELDS | OPTIONAL_FINAL_FIELDS:
         return False
     if not isinstance(value.get("summary"), str) or not value["summary"]:
         return False
@@ -247,7 +251,13 @@ def _valid_final(value: object) -> bool:
         for name in ("verification", "gaps")
     ):
         return False
-    return value.get("verdict") in FINAL_VERDICTS
+    if value.get("verdict") not in FINAL_VERDICTS:
+        return False
+    if "served_model" in value:
+        served = value["served_model"]
+        if not isinstance(served, str) or not served or len(served) > 512:
+            return False
+    return True
 
 
 def validate_response(value: object) -> dict[str, object]:
@@ -314,10 +324,16 @@ def format_response(response: Mapping[str, object], *, caller: str) -> str:
         lines.append("gaps: " + "; ".join(gaps))
     return "\n".join(lines) + "\n"
 
-def format_json_response(response: Mapping[str, object], *, caller: str) -> str:
+def format_json_response(
+    response: Mapping[str, object],
+    *,
+    caller: str,
+    requested_model: str = "",
+) -> str:
     final = response["final"]
     if not isinstance(final, dict):
         raise InvocationError("typed final result is missing")
+    served = final.get("served_model")
     value = {
         "caller": caller,
         "request_id": response["request_id"],
@@ -325,6 +341,8 @@ def format_json_response(response: Mapping[str, object], *, caller: str) -> str:
         "verification": final["verification"],
         "gaps": final["gaps"],
         "verdict": final["verdict"],
+        "requested_model": requested_model,
+        "served_model": served if isinstance(served, str) else "",
     }
     return json.dumps(value, separators=(",", ":")) + "\n"
 
@@ -346,7 +364,9 @@ def main() -> int:
         ))
         response = invoke_broker(socket_path, policy, prompt)
         output = (
-            format_json_response(response, caller=policy.caller)
+            format_json_response(
+                response, caller=policy.caller, requested_model=policy.model,
+            )
             if json_output
             else format_response(response, caller=policy.caller)
         )

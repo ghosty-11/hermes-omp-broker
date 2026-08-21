@@ -40,7 +40,7 @@
         "timeout": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "maximum": 810
+          "maximum": 3600
         }
       }
     },
@@ -89,7 +89,8 @@
         },
         "verdict": {
           "enum": ["MET", "PARTIALLY MET", "NOT MET"]
-        }
+        },
+        "served_model": { "type": "string", "minLength": 1, "maxLength": 512 }
       }
     },
     "id": {

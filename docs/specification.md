@@ -24,7 +24,7 @@ A production bridge must:
 - fail closed on malformed input or output;
 - never push, publish, merge, restart, or spend beyond policy without explicit authority.
 
-The JSON Schema in [`schemas/coding-job.schema.json`](../schemas/coding-job.schema.json) defines the protocol-v1 wire request and response. Authorization belongs in the broker, not in the schema.
+The JSON Schema in [`schemas/coding-job.schema.json`](../schemas/coding-job.schema.json) defines the protocol-v1 wire request and response. Authorization belongs in the broker, not in the schema. The public request `timeout` maximum is 3600 seconds so a policy-raised ceiling can travel on the wire; the broker still applies the caller's admitted bound, default 810.
 
 ## OMP integration modes
 
@@ -128,7 +128,13 @@ contains:
 - the model-written summary;
 - verification statements;
 - explicit gaps;
-- a verdict: `MET`, `PARTIALLY MET`, or `NOT MET`.
+- a verdict: `MET`, `PARTIALLY MET`, or `NOT MET`;
+- optional `served_model` (`provider/id`) recorded by `broker_finalize` from the
+  post-fallback extension context model.
+
+A stored result without `served_model` remains valid. Client JSON output names both the
+policy-requested model and the served model; a missing served model is empty so a caller
+can treat it as a gap. The text format does not include those fields.
 
 The broker persists a separate lifecycle status such as `completed`, `failed`, `cancelled`,
 `timed_out`, `orphaned`, or `delivery_failed`. The Hermes adapter independently compares the
@@ -147,7 +153,12 @@ admission never depends on mailbox delivery, and mailbox text cannot grant broke
 
 Untrusted research is screened outside the privileged engineering context. A broker request
 may include a bounded, sourced finding under the task's existing authority; it does not grant
-OMP a new unrestricted web capability.
+OMP a new unrestricted web capability. The research caller may use only broker-owned
+`backlog_search` and `backlog_fetch` adapters through fixed loopback backends. Fetch targets
+must be public HTTP(S) at default ports with public DNS resolution; private, local, reserved,
+credential-bearing and alternate-port URLs fail before extraction. Results are bounded,
+labelled untrusted data or an explicit failure. Writer and legacy callers do not receive
+those tools.
 
 ## Cancellation and recovery
 

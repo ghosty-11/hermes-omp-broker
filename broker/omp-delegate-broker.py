@@ -102,6 +102,7 @@ RESPONSE_FIELDS = {
     "process_group_clear", "final", "request_id",
 }
 FINAL_FIELDS = {"summary", "verification", "gaps", "verdict"}
+OPTIONAL_FINAL_FIELDS = {"served_model"}
 FINAL_VERDICTS = {"MET", "PARTIALLY MET", "NOT MET"}
 SYSTEM_APPEND = (
     "You are an admitted OMP worker behind a fixed Hermes delegation boundary. "
@@ -149,6 +150,8 @@ class Request:
     git_mode: str
     skills: tuple[str, ...]
     create_only: bool
+    fallback_models: tuple[str, ...] | None = None
+    fallback_selectors: tuple[str, ...] = ()
 
 
 def git_common_dir(path: Path) -> Path | None:
@@ -258,20 +261,43 @@ def validate_request(value: object, *, peer_uid: int) -> Request:
     create_only = caller_policy.get("create_only", False)
     if not isinstance(create_only, bool):
         raise ProtocolError("caller create-only policy is invalid")
+    fallback_selectors = _string_tuple("fallback_selectors")
+    if any(not _valid_fallback_model(item) for item in fallback_selectors):
+        raise ProtocolError("caller fallback_selectors policy is invalid")
     return Request(
         value["request_id"], value["task_id"], value["repository"], caller, workspace,
         value["sandbox"], value["model"], prompt, timeout,
         _string_tuple("read_paths"), _string_tuple("write_patterns"),
         str(git_mode), _string_tuple("skills"), create_only,
+        _caller_fallback_models(caller_policy), fallback_selectors,
     )
 
 
-def omp_argv(request: Request, credential_fd: int) -> list[str]:
+def write_retry_overlay(request: Request, directory: Path) -> Path:
+    """Write a private per-request exact-model chain; shared config cannot widen it."""
+    chain = list(fallback_models(request))
+    selectors = list(dict.fromkeys((request.model, *request.fallback_selectors)))
+    path = directory / "retry-overlay.json"
+    value = {
+        "retry": {
+            "fallbackChains": {
+                selector: chain for selector in selectors
+            },
+        },
+    }
+    path.write_text(json.dumps(value, separators=(",", ":")) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path
+
+
+def omp_argv(request: Request, credential_fd: int,
+             *, config_path: Path | None = None) -> list[str]:
     skill_args = (
         ["--skills", ",".join(request.skills)]
         if request.skills
         else ["--no-skills"]
     )
+    config_args = ["--config", str(config_path)] if config_path is not None else []
     return [
         str(OMP_BIN),
         "-p",
@@ -282,6 +308,7 @@ def omp_argv(request: Request, credential_fd: int) -> list[str]:
         "--no-mcp",
         "--trusted-extension", str(EXTENSION),
         *skill_args,
+        *config_args,
         "--no-rules",
         "--approval-mode=yolo",
         "--provider-api-keys-fd", str(credential_fd),
@@ -311,6 +338,7 @@ def omp_environment(
         "OMP_DELEGATE_WRITE_PATTERNS": json.dumps(request.write_patterns),
         "OMP_DELEGATE_GIT_MODE": request.git_mode,
         "OMP_DELEGATE_CREATE_ONLY": "1" if request.create_only else "0",
+        "OMP_DELEGATE_CALLER": request.caller,
     }
     if request.git_mode == "scoped":
         env.update({
@@ -326,6 +354,7 @@ def _fallback_models() -> tuple[str, ...]:
 
     Read from the environment the unit owns, never from the request: a caller that
     could name a fallback could name a provider whose credential it wanted minted.
+    Used only when the caller entry does not carry `fallback_models`.
     """
     raw = os.environ.get("HERMES_OMP_FALLBACK_MODELS", "")
     return tuple(value for value in (part.strip() for part in raw.split(",")) if value)
@@ -334,10 +363,36 @@ def _fallback_models() -> tuple[str, ...]:
 FALLBACK_MODELS = _fallback_models()
 
 
+def _valid_fallback_model(value: str) -> bool:
+    provider, sep, rest = value.partition("/")
+    return bool(sep and provider.strip() and rest.strip() and value == value.strip())
+
+
+def _caller_fallback_models(caller_policy: Mapping[str, object]) -> tuple[str, ...] | None:
+    if "fallback_models" not in caller_policy:
+        return None
+    raw = caller_policy["fallback_models"]
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ProtocolError("caller fallback_models policy is invalid")
+    parsed: list[str] = []
+    for item in raw:
+        if not _valid_fallback_model(item):
+            raise ProtocolError("caller fallback_models policy is invalid")
+        parsed.append(item)
+    return tuple(parsed)
+
+
+def fallback_models(request: Request) -> tuple[str, ...]:
+    """Caller-policy rungs when present; otherwise the service-wide default chain."""
+    if request.fallback_models is not None:
+        return request.fallback_models
+    return FALLBACK_MODELS
+
+
 def credential_providers(request: Request) -> tuple[str, ...]:
-    """The pinned model's provider first, then each fixed fallback rung's, deduplicated."""
+    """The pinned model's provider first, then each admitted fallback rung's, deduplicated."""
     providers = [request.model.partition("/")[0]]
-    for model in FALLBACK_MODELS:
+    for model in fallback_models(request):
         provider = model.partition("/")[0]
         if provider and provider not in providers:
             providers.append(provider)
@@ -393,8 +448,9 @@ def start_omp_process(
         os.fchmod(credential_fd, 0o600)
         os.write(credential_fd, payload)
         os.lseek(credential_fd, 0, os.SEEK_SET)
+        config_path = write_retry_overlay(request, final_path.parent)
         return subprocess.Popen(
-            omp_argv(request, credential_fd),
+            omp_argv(request, credential_fd, config_path=config_path),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -467,7 +523,10 @@ def _valid_final(path: Path) -> dict[str, object] | None:
         value = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(value, dict) or set(value) != FINAL_FIELDS:
+    if not isinstance(value, dict):
+        return None
+    keys = set(value)
+    if not FINAL_FIELDS <= keys or not keys <= FINAL_FIELDS | OPTIONAL_FINAL_FIELDS:
         return None
     if not isinstance(value.get("summary"), str) or not value["summary"]:
         return None
@@ -478,6 +537,10 @@ def _valid_final(path: Path) -> dict[str, object] | None:
         return None
     if value.get("verdict") not in FINAL_VERDICTS:
         return None
+    if "served_model" in value:
+        served = value["served_model"]
+        if not isinstance(served, str) or not served or len(served) > 512:
+            return None
     return value
 
 
