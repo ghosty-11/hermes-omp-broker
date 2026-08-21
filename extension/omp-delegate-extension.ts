@@ -149,27 +149,50 @@ function researchQuery(raw: unknown): string | null {
   return query;
 }
 
-const PRIVATE_ADDRESSES = new BlockList();
-for (const [network, prefix, family] of [
-  ["0.0.0.0", 8, "ipv4"], ["10.0.0.0", 8, "ipv4"],
-  ["100.64.0.0", 10, "ipv4"], ["127.0.0.0", 8, "ipv4"],
-  ["169.254.0.0", 16, "ipv4"], ["172.16.0.0", 12, "ipv4"],
-  ["192.0.0.0", 24, "ipv4"], ["192.0.2.0", 24, "ipv4"],
-  ["192.168.0.0", 16, "ipv4"], ["198.18.0.0", 15, "ipv4"],
-  ["198.51.100.0", 24, "ipv4"], ["203.0.113.0", 24, "ipv4"],
-  ["224.0.0.0", 4, "ipv4"], ["240.0.0.0", 4, "ipv4"],
-  ["::", 128, "ipv6"], ["::1", 128, "ipv6"],
-  ["::ffff:0:0", 96, "ipv6"], ["fc00::", 7, "ipv6"],
-  ["fe80::", 10, "ipv6"], ["ff00::", 8, "ipv6"],
-  ["2001:db8::", 32, "ipv6"],
-] as Array<[string, number, "ipv4" | "ipv6"]>) {
-  PRIVATE_ADDRESSES.addSubnet(network, prefix, family);
+const PRIVATE_IPV4 = new BlockList();
+const PRIVATE_IPV6 = new BlockList();
+// Node's BlockList treats IPv4 as matching ::ffff:0:0/96. Keep that rule
+// on the IPv6 list only, and convert mapped addresses to IPv4 first.
+for (const [network, prefix] of [
+  ["0.0.0.0", 8], ["10.0.0.0", 8],
+  ["100.64.0.0", 10], ["127.0.0.0", 8],
+  ["169.254.0.0", 16], ["172.16.0.0", 12],
+  ["192.0.0.0", 24], ["192.0.2.0", 24],
+  ["192.168.0.0", 16], ["198.18.0.0", 15],
+  ["198.51.100.0", 24], ["203.0.113.0", 24],
+  ["224.0.0.0", 4], ["240.0.0.0", 4],
+] as Array<[string, number]>) {
+  PRIVATE_IPV4.addSubnet(network, prefix, "ipv4");
+}
+for (const [network, prefix] of [
+  ["::", 128], ["::1", 128],
+  ["::ffff:0:0", 96], ["fc00::", 7],
+  ["fe80::", 10], ["ff00::", 8],
+  ["2001:db8::", 32],
+] as Array<[string, number]>) {
+  PRIVATE_IPV6.addSubnet(network, prefix, "ipv6");
 }
 
-function publicAddress(address: string): boolean {
+export function mappedIPv4(address: string): string | null {
+  const lower = address.toLowerCase();
+  if (!lower.startsWith("::ffff:")) return null;
+  const rest = address.slice(address.toLowerCase().indexOf("::ffff:") + 7);
+  if (isIP(rest) === 4) return rest;
+  const hex = rest.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  if (!hex) return null;
+  const high = Number.parseInt(hex[1], 16);
+  const low = Number.parseInt(hex[2], 16);
+  return `${(high >> 8) & 255}.${high & 255}.${(low >> 8) & 255}.${low & 255}`;
+}
+
+export function publicAddress(address: string): boolean {
   const version = isIP(address);
-  if (version === 4) return !PRIVATE_ADDRESSES.check(address, "ipv4");
-  if (version === 6) return !PRIVATE_ADDRESSES.check(address, "ipv6");
+  if (version === 4) return !PRIVATE_IPV4.check(address, "ipv4");
+  if (version === 6) {
+    const ipv4 = mappedIPv4(address);
+    if (ipv4) return !PRIVATE_IPV4.check(ipv4, "ipv4");
+    return !PRIVATE_IPV6.check(address, "ipv6");
+  }
   return false;
 }
 

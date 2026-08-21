@@ -430,6 +430,66 @@ console.log(JSON.stringify({{calls,results:[a,b]}}));''', encoding="utf-8")
                             for row in value["results"]))
 
 
+
+class ResearchFetchPublicAddressTest(unittest.TestCase):
+    """backlog_fetch must admit public IPv4 and reject mapped private IPv6."""
+
+    def _run(self, urls: list[str]) -> dict:
+        with tempfile.TemporaryDirectory() as td:
+            runner = Path(td) / "runner.ts"
+            listed = json.dumps(urls)
+            runner.write_text(f'''import extension from {json.dumps(EXTENSION.as_uri())};
+const tools = new Map<string, any>();
+const scalar = {{ optional() {{ return this; }}, describe() {{ return this; }} }};
+const fetched: string[] = [];
+globalThis.fetch = async (_url: string, init?: {{body?: string}}) => {{
+  const body = typeof init?.body === "string" ? JSON.parse(init.body) : {{}};
+  fetched.push(String(body.url || ""));
+  return new Response(JSON.stringify({{success:true,data:{{markdown:"ok"}}}}),
+                      {{status:200,headers:{{"content-type":"application/json"}}}});
+}};
+const pi = {{
+  zod: {{string:()=>scalar,number:()=>scalar,array:()=>scalar,enum:()=>scalar,object:()=>scalar}},
+  on: () => {{}},
+  registerTool: (t:any) => tools.set(t.name,t),
+}};
+extension(pi);
+const tool = tools.get("backlog_fetch");
+const results = [];
+for (const url of {listed}) {{
+  results.push(await tool.execute("id", {{url}}));
+}}
+console.log(JSON.stringify({{fetched, results}}));''', encoding="utf-8")
+            env = {**os.environ, "OMP_DELEGATE_CALLER": RESEARCH,
+                   "OMP_DELEGATE_SANDBOX": "restricted-write",
+                   "OMP_DELEGATE_READ_PATHS": "[]",
+                   "OMP_DELEGATE_WRITE_PATTERNS": '["runs/**"]',
+                   "OMP_DELEGATE_GIT_MODE": "none"}
+            result = subprocess.run(
+                ["node", str(runner)], env=env, text=True,
+                capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_public_ipv4_is_fetched_and_mapped_private_is_not(self) -> None:
+        value = self._run([
+            "http://8.8.8.8/public",
+            "http://127.0.0.1/private",
+            "http://10.0.0.1/private",
+            "http://[::ffff:127.0.0.1]/mapped-private",
+            "http://[::ffff:8.8.8.8]/mapped-public",
+        ])
+        fetched = value["fetched"]
+        self.assertIn("http://8.8.8.8/public", fetched)
+        self.assertTrue(any("mapped-public" in url for url in fetched))
+        self.assertNotIn("http://127.0.0.1/private", fetched)
+        self.assertNotIn("http://10.0.0.1/private", fetched)
+        self.assertFalse(any("mapped-private" in url for url in fetched))
+        texts = " ".join(row["content"][0]["text"] for row in value["results"]
+                         if row.get("isError"))
+        self.assertIn("invalid url", texts)
+
+
 class ResearchPolicySchemaTest(unittest.TestCase):
     def test_schema_admits_policy_max_timeout_3600(self) -> None:
         schema = json.loads(SCHEMA.read_text())
