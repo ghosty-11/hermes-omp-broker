@@ -151,6 +151,57 @@ class Request:
     create_only: bool
 
 
+def git_common_dir(path: Path) -> Path | None:
+    """The shared .git of a checkout or worktree, or None if it is not git."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    common = Path(result.stdout.strip())
+    if not common.is_absolute():
+        common = path / common
+    try:
+        return common.resolve()
+    except OSError:
+        return None
+
+
+def git_toplevel(path: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        return Path(result.stdout.strip()).resolve()
+    except OSError:
+        return None
+
+
+def is_worktree_of(candidate: Path, admitted: Path) -> bool:
+    """True when candidate is an already-created worktree root of admitted.
+
+    The broker never creates worktrees. A nested directory of the admitted
+    checkout is not a worktree: its toplevel is the checkout, not itself.
+    """
+    if not candidate.is_dir() or not admitted.is_dir():
+        return False
+    cand, adm = candidate.resolve(), admitted.resolve()
+    if cand == adm:
+        return False
+    if git_toplevel(cand) != cand:
+        return False
+    left, right = git_common_dir(cand), git_common_dir(adm)
+    return left is not None and left == right
+
+
 def validate_request(value: object, *, peer_uid: int) -> Request:
     allowed_uid = int(os.environ.get("HERMES_OMP_CALLER_UID", str(os.getuid())))
     if peer_uid != allowed_uid:
@@ -167,10 +218,16 @@ def validate_request(value: object, *, peer_uid: int) -> Request:
     if caller not in ALLOWED_WORKSPACES:
         raise ProtocolError("caller is not allowlisted")
     workspace = Path(value["workspace"]).resolve()
+    admitted = REPOSITORY_PATHS.get(value["repository"])
     allowed = {path.resolve() for path in ALLOWED_WORKSPACES[caller]}
-    if workspace not in allowed:
+    mapped = admitted is not None and (
+        workspace == admitted.resolve() or is_worktree_of(workspace, admitted)
+    )
+    if workspace not in allowed and not (
+        admitted is not None and is_worktree_of(workspace, admitted)
+    ):
         raise ProtocolError("workspace is not allowlisted for caller")
-    if REPOSITORY_PATHS.get(value["repository"]) != workspace:
+    if not mapped:
         raise ProtocolError("repository key does not map to requested workspace")
     if value["sandbox"] != ALLOWED_SANDBOXES[caller]:
         raise ProtocolError("sandbox is not fixed for caller")

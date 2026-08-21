@@ -9,6 +9,7 @@ import os
 import socket
 import struct
 import sys
+import subprocess
 from pathlib import Path
 from typing import Mapping
 
@@ -39,6 +40,51 @@ class Policy:
     sandbox: str
     model: str
     timeout: float
+
+
+def _git_common_dir(path: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    common = Path(result.stdout.strip())
+    if not common.is_absolute():
+        common = path / common
+    try:
+        return common.resolve()
+    except OSError:
+        return None
+
+
+def _git_toplevel(path: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        return Path(result.stdout.strip()).resolve()
+    except OSError:
+        return None
+
+
+def _is_worktree_of(candidate: Path, admitted: Path) -> bool:
+    if not candidate.is_dir() or not admitted.is_dir():
+        return False
+    cand, adm = candidate.resolve(), admitted.resolve()
+    if cand == adm:
+        return False
+    if _git_toplevel(cand) != cand:
+        return False
+    left, right = _git_common_dir(cand), _git_common_dir(adm)
+    return left is not None and left == right
 
 
 def _load_policy(env: Mapping[str, str]) -> tuple[dict[str, Path], dict[str, dict[str, object]]]:
@@ -164,8 +210,11 @@ def resolve_policy(env: Mapping[str, str], cwd: Path) -> Policy:
     request_id = env.get("OMP_REQUEST_ID") or os.urandom(8).hex()
     task_id = env.get("OMP_TASK_ID") or request_id
     requested = env.get("OMP_DELEGATE_WORKSPACE")
-    if requested and Path(requested).resolve() != workspace:
-        raise InvocationError("requested workspace does not match the caller policy")
+    if requested:
+        req = Path(requested).resolve()
+        if req != workspace and not _is_worktree_of(req, workspace):
+            raise InvocationError("requested workspace does not match the caller policy")
+        workspace = req
     try:
         timeout = float(env.get("OMP_DELEGATE_TIMEOUT", "780"))
     except ValueError as exc:
