@@ -69,7 +69,8 @@ def _load_policy(env: Mapping[str, str]) -> tuple[dict[str, Path], dict[str, dic
     except (OSError, ValueError, TypeError):
         return {}, {}
 
-def _policy_model(env: Mapping[str, str]) -> str:
+def _policy_model(env: Mapping[str, str], caller: str = "delegate_to_omp") -> str:
+    """Per-caller pin first, then the global policy model, then the environment."""
     policy_path = Path(env.get(
         "HERMES_OMP_POLICY",
         str(Path(__file__).with_name("policy.json")),
@@ -77,9 +78,27 @@ def _policy_model(env: Mapping[str, str]) -> str:
     try:
         value = json.loads(policy_path.read_text())
     except (OSError, ValueError, TypeError):
-        return MODEL
-    model = value.get("model") if isinstance(value, dict) else None
-    return model if isinstance(model, str) and model else MODEL
+        return env.get("HERMES_OMP_MODEL", MODEL)
+    if not isinstance(value, dict):
+        return env.get("HERMES_OMP_MODEL", MODEL)
+    callers = value.get("callers")
+    entry = callers.get(caller) if isinstance(callers, dict) else None
+    pinned = entry.get("model") if isinstance(entry, dict) else None
+    if isinstance(pinned, str) and pinned:
+        return pinned
+    model = value.get("model")
+    if isinstance(model, str) and model:
+        return model
+    return env.get("HERMES_OMP_MODEL", MODEL)
+
+
+def _caller_max_timeout(callers: Mapping[str, dict[str, object]], caller: str) -> float:
+    """The caller's admitted ceiling — mirrors the broker's bound exactly."""
+    entry = callers.get(caller)
+    value = entry.get("max_timeout") if isinstance(entry, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 810.0
+    return min(float(value), 3600.0)
 
 
 def _policy_socket(env: Mapping[str, str]) -> Path:
@@ -151,9 +170,9 @@ def resolve_policy(env: Mapping[str, str], cwd: Path) -> Policy:
         timeout = float(env.get("OMP_DELEGATE_TIMEOUT", "780"))
     except ValueError as exc:
         raise InvocationError("timeout is not numeric") from exc
-    if timeout <= 0 or timeout > 810:
+    if timeout <= 0 or timeout > _caller_max_timeout(callers, caller):
         raise InvocationError("timeout is outside the broker bound")
-    model = env.get("HERMES_OMP_MODEL", _policy_model(env))
+    model = _policy_model(env, caller)
     return Policy(
         request_id, task_id, repository, caller, workspace, sandbox, model, timeout,
     )

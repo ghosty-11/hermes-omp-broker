@@ -175,7 +175,12 @@ function configuredWritePatterns(): RegExp[] {
   }
   if (!Array.isArray(values) || !values.every((value) => typeof value === "string")) return [];
   return values.map((value) => {
-    const escaped = value.replace(/[.+^${}()|[\]\\]/g, "\\$&").replaceAll("*", "[^/]*");
+    // `**` crosses path separators; a single `*` never does. `**` is swapped
+    // through a placeholder so the single-star pass cannot see its halves.
+    const escaped = value.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replaceAll("**", "\u0000")
+      .replaceAll("*", "[^/]*")
+      .replaceAll("\u0000", ".*");
     return new RegExp(`^${escaped}$`);
   });
 }
@@ -188,13 +193,46 @@ function restrictedWriteAllowed(raw: unknown, workspace: string): boolean {
   return configuredWritePatterns().some((pattern) => pattern.test(rel));
 }
 
+function tokenizeGitCommand(command: string): string[] | null {
+  // Wiki filenames carry spaces, so scoped git must honour shell quoting.
+  // Single and double quotes group; no escape processing (the metacharacter
+  // gate above already rejected `$` and backslashes stay literal, which git
+  // treats as path bytes). Unbalanced quotes reject the whole command.
+  const tokens: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+  let started = false;
+  for (const ch of command) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      else current += ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      started = true;
+    } else if (/\s/.test(ch)) {
+      if (started) {
+        tokens.push(current);
+        current = "";
+        started = false;
+      }
+    } else {
+      current += ch;
+      started = true;
+    }
+  }
+  if (quote) return null;
+  if (started) tokens.push(current);
+  return tokens;
+}
+
 function scopedGitCommandAllowed(input: unknown, workspace: string): boolean {
   if (process.env.OMP_DELEGATE_GIT_MODE !== "scoped"
     || !input || typeof input !== "object" || !("command" in input)
     || typeof input.command !== "string") return false;
   const command = input.command.trim();
   if (/[;&|`$<>\n\r]/.test(command)) return false;
-  const tokens = command.split(/\s+/);
+  const tokens = tokenizeGitCommand(command);
+  if (tokens === null) return false;
   if (tokens[0] !== "git") return false;
   const subcommand = tokens[1];
   const args = tokens.slice(2);
@@ -241,6 +279,12 @@ function scopedGitCommandAllowed(input: unknown, workspace: string): boolean {
   if (subcommand === "add") {
     const paths = args.filter((arg) => arg !== "--");
     return paths.length > 0 && paths.every((path) => restrictedWriteAllowed(path, workspace));
+  }
+  if (subcommand === "mv") {
+    // Stage promotion and archiving move a note between admitted folders.
+    // Both ends must satisfy the write patterns; nothing leaves the boundary.
+    const paths = args.filter((arg) => arg !== "--");
+    return paths.length === 2 && paths.every((path) => restrictedWriteAllowed(path, workspace));
   }
   return subcommand === "commit"
     && /^git commit(?: -m (?:'[^']+'|"[^"]+")){1,2}$/.test(command);

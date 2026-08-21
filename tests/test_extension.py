@@ -104,6 +104,60 @@ console.log(JSON.stringify(output));''')
         self.assertTrue(results[2]["block"])
         self.assertTrue(results[3]["block"])
 
+    def test_globstar_write_pattern_admits_nested_paths(self) -> None:
+        """`backlog/**` must admit the whole subtree, not one path segment.
+
+        The first translation mapped every `*` to `[^/]*`, so `backlog/**`
+        silently admitted only `backlog/<file>` — a wiki caller could not
+        write a triage note two levels down while the policy read as if it
+        could. Nested paths are the entire point of a `**` pattern.
+        """
+        results = self.exercise([
+            {"toolName": "write", "input": {"path": "backlog/triage/note.md", "content": "x"}},
+            {"toolName": "write", "input": {"path": "backlog/a/b/c.md", "content": "x"}},
+            {"toolName": "write", "input": {"path": "outside/note.md", "content": "x"}},
+            {"toolName": "write", "input": {"path": "backlogged/nope.md", "content": "x"}},
+        ], sandbox="restricted-write", write_patterns=["backlog/**", "log.md"])
+        self.assertIsNone(results[0])
+        self.assertIsNone(results[1])
+        self.assertTrue(results[2]["block"])
+        self.assertTrue(results[3]["block"])
+
+    def test_scoped_git_mv_requires_both_paths_inside_patterns(self) -> None:
+        """Stage promotion is a `git mv`; both ends must sit inside the boundary."""
+        results = self.exercise([
+            {"toolName": "bash", "input": {"command": "git mv backlog/ideas/a.md backlog/_archive/a.md"}},
+            {"toolName": "bash", "input": {"command": "git mv backlog/ideas/a.md ../outside.md"}},
+            {"toolName": "bash", "input": {"command": "git mv secret.md backlog/_archive/secret.md"}},
+            {"toolName": "bash", "input": {"command": "git mv backlog/ideas/a.md"}},
+        ], sandbox="restricted-write", write_patterns=["backlog/**"], git_mode="scoped",
+            existing_paths=["backlog/ideas/a.md", "secret.md"])
+        self.assertIsNone(results[0])
+        self.assertTrue(results[1]["block"])
+        self.assertTrue(results[2]["block"])
+        self.assertTrue(results[3]["block"])
+
+    def test_scoped_git_accepts_quoted_paths_with_spaces(self) -> None:
+        """Wiki filenames carry spaces; an unquotable path is an unusable boundary.
+
+        The first live maturation run (2026-08-21) created
+        `backlog/triage/Market Oracle Agentic Upgrade Research.md` and could not
+        `git add` or `git mv` it: the token splitter broke the path at each space,
+        checked the fragments, and refused. The child left the whole run
+        uncommitted, which the wrapper correctly reported as disagreement.
+        """
+        results = self.exercise([
+            {"toolName": "bash", "input": {"command": "git add 'backlog/triage/A B.md'"}},
+            {"toolName": "bash", "input": {"command": 'git mv "backlog/triage/A B.md" "backlog/_archive/A B.md"'}},
+            {"toolName": "bash", "input": {"command": "git add 'secret file.md'"}},
+            {"toolName": "bash", "input": {"command": "git add 'backlog/unclosed"}},
+        ], sandbox="restricted-write", write_patterns=["backlog/**"], git_mode="scoped",
+            existing_paths=["backlog/triage/A B.md", "secret file.md"])
+        self.assertIsNone(results[0])
+        self.assertIsNone(results[1])
+        self.assertTrue(results[2]["block"])
+        self.assertTrue(results[3]["block"])
+
     def test_broker_finalizer_records_typed_result(self) -> None:
         [result] = self.exercise([{
             "kind": "broker_finalize",

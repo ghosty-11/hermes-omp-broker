@@ -41,6 +41,7 @@ MAX_REQUEST_BYTES = 1_000_000
 MAX_RESPONSE_BYTES = 8_000_000
 MAX_PROMPT_CHARS = 500_000
 MAX_TIMEOUT = 810.0
+ABSOLUTE_MAX_TIMEOUT = 3600.0
 FRAME_TIMEOUT = 5.0
 JOB_STORE = JobStore(Path(os.environ.get("HERMES_OMP_JOB_DIR", "state/jobs")))
 _ACTIVE_PROCESS_GROUP: int | None = None
@@ -114,6 +115,24 @@ class ProtocolError(RuntimeError):
     pass
 
 
+def effective_model(caller: str) -> str:
+    """The caller's pinned model, or the global one. Never caller-supplied."""
+    value = CALLER_POLICIES.get(caller, {}).get("model")
+    return value if isinstance(value, str) and value else MODEL
+
+
+def effective_max_timeout(caller: str) -> float:
+    """The caller's timeout ceiling, bounded by the broker's absolute cap.
+
+    Policy-side only, like the model pin: a caller that could raise its own
+    ceiling could hold the single-writer workspace lock indefinitely.
+    """
+    value = CALLER_POLICIES.get(caller, {}).get("max_timeout")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return MAX_TIMEOUT
+    return min(float(value), ABSOLUTE_MAX_TIMEOUT)
+
+
 @dataclasses.dataclass(frozen=True)
 class Request:
     request_id: str
@@ -155,7 +174,7 @@ def validate_request(value: object, *, peer_uid: int) -> Request:
         raise ProtocolError("repository key does not map to requested workspace")
     if value["sandbox"] != ALLOWED_SANDBOXES[caller]:
         raise ProtocolError("sandbox is not fixed for caller")
-    if value["model"] != MODEL:
+    if value["model"] != effective_model(caller):
         raise ProtocolError("model does not match broker policy")
     prompt = value["prompt"]
     if not prompt or len(prompt) > MAX_PROMPT_CHARS:
@@ -164,7 +183,7 @@ def validate_request(value: object, *, peer_uid: int) -> Request:
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
         raise ProtocolError("timeout is not numeric")
     timeout = float(timeout)
-    if timeout <= 0 or timeout > MAX_TIMEOUT:
+    if timeout <= 0 or timeout > effective_max_timeout(caller):
         raise ProtocolError("timeout is outside the broker bound")
     caller_policy = CALLER_POLICIES[caller]
 
@@ -319,6 +338,14 @@ def start_omp_process(
             ),
             start_new_session=True,
             pass_fds=(credential_fd,),
+            # The unit's own UMask=0077 protects broker state, but a
+            # restricted-write child inheriting it writes 0600 files into the
+            # setgid group-shared wiki — the first live wiki job (2026-08-21)
+            # produced a triage note the hermes-side projector could not read.
+            # Scoped to restricted-write: those callers exist precisely to
+            # produce group-consumed artefacts; workspace-write children keep
+            # the inherited umask. Credentials stay 0600 explicitly.
+            umask=0o002 if request.sandbox == "restricted-write" else -1,
         )
     finally:
         os.close(credential_fd)
