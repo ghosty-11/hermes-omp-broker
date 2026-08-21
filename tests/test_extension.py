@@ -277,6 +277,7 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
                         worktree, git_mode="scoped", command=command),
                     capture_output=True, text=True, check=False)
                 self.assertEqual(0, result.returncode, f"{command}\n{result.stderr}")
+                self.assertNotIn("Failed to create stream fd", result.stderr)
             self.assertFalse(subprocess.run(
                 ["git", "-C", str(worktree), "status", "--porcelain"],
                 capture_output=True, text=True, check=True,

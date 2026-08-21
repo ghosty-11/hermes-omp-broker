@@ -400,7 +400,7 @@ export function buildSandboxArgv(command: string, workspaceValue: string): strin
       "--setenv", "GIT_CONFIG_VALUE_0", workspace,
     );
   }
-  argv.push("/bin/bash", "-lc", command);
+  argv.push("/bin/bash", "-c", command);
   return argv;
 }
 
