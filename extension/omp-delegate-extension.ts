@@ -526,12 +526,16 @@ export default function ompDelegateExtension(pi: PiApi): void {
   });
 
   const z = pi.zod;
+  const scopedGitOnly = process.env.OMP_DELEGATE_SANDBOX === "restricted-write"
+    && process.env.OMP_DELEGATE_GIT_MODE === "scoped";
   const bashTool = {
     name: "bash",
-    label: "Sandboxed Bash",
-    description: "Run one command inside a networkless bubblewrap sandbox limited to the admitted workspace.",
+    label: scopedGitOnly ? "Scoped Git" : "Sandboxed Bash",
+    description: scopedGitOnly
+      ? "Run one allowlisted Git command in the admitted workspace. Allowed forms: git status, git log, git diff, git add with admitted paths, git mv between admitted paths, and git commit -m. General shell commands are denied."
+      : "Run one command inside a networkless bubblewrap sandbox limited to the admitted workspace.",
     parameters: z.object({
-      command: z.string().describe("Command to run"),
+      command: z.string().describe(scopedGitOnly ? "One exact allowlisted Git command" : "Command to run"),
       timeout: z.number().optional().describe("Timeout in seconds"),
     }),
     approval: "exec",

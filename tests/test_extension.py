@@ -283,6 +283,18 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
                 capture_output=True, text=True, check=True,
             ).stdout.strip())
 
+    def test_restricted_bash_definition_advertises_scoped_git_only(self) -> None:
+        [definition] = self.exercise(
+            [{"kind": "tool_definition", "name": "bash"}],
+            sandbox="restricted-write",
+            write_patterns=["backlog/**"],
+            git_mode="scoped",
+        )
+        self.assertEqual("Scoped Git", definition["label"])
+        for command in ("git status", "git log", "git diff", "git add", "git mv", "git commit"):
+            self.assertIn(command, definition["description"])
+        self.assertIn("General shell commands are denied", definition["description"])
+
     def test_boundary_tools_are_always_visible_to_the_model(self) -> None:
         definitions = self.exercise([
             {"kind": "tool_definition", "name": "bash"},
