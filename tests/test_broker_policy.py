@@ -216,12 +216,16 @@ class BrokerPolicyTest(unittest.TestCase):
                 "workspace-write", "provider/model", "bounded", 10,
                 (), (), "none", (), False,
             )
-            argv = module.omp_argv(request, "/proc/self/fd/9")
+            argv = module.omp_argv(request, 9)
             self.assertFalse(
-                any(value.startswith("--tools=") for value in argv),
+                any(str(value).startswith("--tools=") for value in argv),
                 "a builtin allowlist hides trusted-extension tools before registration",
             )
             self.assertIn("--trusted-extension", argv)
+            fd_flag = argv.index("--provider-api-keys-fd")
+            self.assertEqual(argv[fd_flag + 1], "9")
+            self.assertNotIn("--provider-api-keys", argv)
+            self.assertFalse(any(str(value).startswith("/proc/self/fd/") for value in argv))
 
     def test_fixed_fallback_providers_also_receive_credentials(self) -> None:
         """A fallback chain the child cannot authenticate is not a fallback.

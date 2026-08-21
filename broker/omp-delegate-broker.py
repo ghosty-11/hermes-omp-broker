@@ -264,7 +264,7 @@ def validate_request(value: object, *, peer_uid: int) -> Request:
     )
 
 
-def omp_argv(request: Request, credential_path: str) -> list[str]:
+def omp_argv(request: Request, credential_fd: int) -> list[str]:
     skill_args = (
         ["--skills", ",".join(request.skills)]
         if request.skills
@@ -282,7 +282,7 @@ def omp_argv(request: Request, credential_path: str) -> list[str]:
         *skill_args,
         "--no-rules",
         "--approval-mode=yolo",
-        "--provider-api-keys", credential_path,
+        "--provider-api-keys-fd", str(credential_fd),
         "--model", request.model,
         "--cwd", str(request.workspace),
         "--append-system-prompt", SYSTEM_APPEND,
@@ -385,7 +385,7 @@ def start_omp_process(
         os.write(credential_fd, payload)
         os.lseek(credential_fd, 0, os.SEEK_SET)
         return subprocess.Popen(
-            omp_argv(request, f"/proc/self/fd/{credential_fd}"),
+            omp_argv(request, credential_fd),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

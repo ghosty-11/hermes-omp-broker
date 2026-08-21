@@ -5,7 +5,7 @@
 Use Python 3.11 or newer on a POSIX host with Unix peer credentials and process groups.
 Install OMP first and verify `omp --help`.
 
-The broker requires OMP support for `--no-mcp`, `--provider-api-keys`, and
+The broker requires OMP support for `--no-mcp`, `--provider-api-keys-fd`, and
 `--trusted-extension`; see [Compatibility](compatibility.md). Do not deploy against an OMP
 revision that lacks any of those seams.
 Choose two identities:

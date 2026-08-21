@@ -11,8 +11,9 @@ revisions before each deployment or upgrade. The shipped broker uses one-shot OM
 the Node SDK, and ACP are documented alternatives rather than tested package seams.
 
 The reference broker requires three OMP CLI seams: `--no-mcp`,
-`--provider-api-keys`, and `--trusted-extension`. They are present in reviewed OMP commit
-[`448632b8190eac71b8e187880bea234a513773df`](https://github.com/can1357/oh-my-pi/commit/448632b8190eac71b8e187880bea234a513773df).
-They are broker-facing containment/credential seams rather than portable assumptions about
-older OMP releases. Pin an OMP revision containing all three and run the disposable
+`--provider-api-keys-fd`, and `--trusted-extension`. They are present in reviewed OMP
+commit
+[`2039ea608dd55714abb30f07984c6a5add62a4a2`](https://github.com/ghosty-11/oh-my-pi/commit/2039ea608dd55714abb30f07984c6a5add62a4a2).
+They are broker-facing containment and credential seams rather than portable assumptions
+about older OMP releases. Pin an OMP revision containing all three and run the disposable
 credential-denial and extension-isolation scenarios before enabling the service.
