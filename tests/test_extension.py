@@ -31,7 +31,8 @@ class ExtensionTest(unittest.TestCase):
                 target.write_text("existing")
             final = root / "final.json"
             runner = root / "runner.ts"
-            runner.write_text(f'''import extension from {json.dumps(EXTENSION.as_uri())};
+            runner.write_text(f'''import {{ readFileSync }} from "node:fs";
+import extension from {json.dumps(EXTENSION.as_uri())};
 const handlers = new Map<string, Function>(); const tools = new Map<string, unknown>();
 const scalar = {{ optional() {{ return this; }}, describe() {{ return this; }} }};
 const pi = {{ zod: {{ string: () => scalar, number: () => scalar, array: (_v: unknown) => scalar, enum: (_v: unknown) => scalar, object: (_v: unknown) => scalar }}, on: (n: string, h: Function) => handlers.set(n,h), registerTool: (t: {{name:string}}) => tools.set(t.name,t) }};
@@ -40,6 +41,7 @@ const output: unknown[] = []; const ctx = {{cwd:{json.dumps(str(workspace))}}};
 for (const event of {json.dumps(events)}) {{
   if (event.kind === "tool_definition") output.push(tools.get(String(event.name)));
   else if (event.kind === "broker_finalize") output.push(await (tools.get("broker_finalize") as any).execute("id", event.input));
+  else if (event.kind === "final_file") output.push(JSON.parse(readFileSync({json.dumps(str(final))}, "utf8")));
   else output.push(await handlers.get("tool_call")!(event,ctx));
 }}
 console.log(JSON.stringify(output));''')
@@ -53,6 +55,28 @@ console.log(JSON.stringify(output));''')
                 "OMP_DELEGATE_CREATE_ONLY": "1" if create_only else "0",
             }
             result = subprocess.run(["node", str(runner)], env=env, text=True, capture_output=True, check=False)
+        self.assertEqual(0, result.returncode, result.stderr)
+        return json.loads(result.stdout)
+
+    def sandbox_argv(
+        self,
+        workspace: Path,
+        *,
+        git_mode: str,
+        command: str = "git status --short",
+    ) -> list[str]:
+        with tempfile.TemporaryDirectory() as td:
+            runner = Path(td) / "runner.ts"
+            runner.write_text(f'''import {{ buildSandboxArgv }} from {json.dumps(EXTENSION.as_uri())};
+console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(str(workspace))})));''')
+            env = {
+                **os.environ,
+                "OMP_DELEGATE_SANDBOX": "restricted-write",
+                "OMP_DELEGATE_GIT_MODE": git_mode,
+            }
+            result = subprocess.run(
+                ["node", str(runner)], env=env, text=True,
+                capture_output=True, check=False)
         self.assertEqual(0, result.returncode, result.stderr)
         return json.loads(result.stdout)
 
@@ -158,17 +182,105 @@ console.log(JSON.stringify(output));''')
         self.assertTrue(results[2]["block"])
         self.assertTrue(results[3]["block"])
 
-    def test_broker_finalizer_records_typed_result(self) -> None:
-        [result] = self.exercise([{
-            "kind": "broker_finalize",
-            "input": {
-                "summary": "read-only smoke complete",
-                "verification": ["git status --short returned empty"],
-                "gaps": [],
-                "verdict": "MET",
+    def test_broker_finalizer_records_meaningful_scalar_result(self) -> None:
+        result, recorded = self.exercise([
+            {
+                "kind": "broker_finalize",
+                "input": {
+                    "summary": "The requested bounded change is complete.",
+                    "verification": "git status --short returned empty",
+                    "gaps": "",
+                    "verdict": "MET",
+                },
             },
-        }])
+            {"kind": "final_file"},
+        ])
         self.assertIn("recorded", result["content"][0]["text"].lower())
+        self.assertFalse(result.get("isError", False))
+        self.assertEqual(["git status --short returned empty"], recorded["verification"])
+        self.assertEqual([], recorded["gaps"])
+
+    def test_placeholder_finalize_is_rejected_without_locking_the_turn(self) -> None:
+        results = self.exercise([
+            {
+                "kind": "broker_finalize",
+                "input": {
+                    "summary": "test summary",
+                    "verification": "a\\nb",
+                    "gaps": "c",
+                    "verdict": "NOT MET",
+                },
+            },
+            {"toolName": "read", "input": {"path": "inside.txt"}},
+        ])
+        self.assertTrue(results[0]["isError"])
+        self.assertIsNone(results[1])
+
+    def test_scoped_git_binds_only_the_linked_common_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+            (repo / "seed").write_text("s\\n")
+            subprocess.run(["git", "add", "seed"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=repo, check=True)
+            worktree = root / "worktree"
+            subprocess.run(["git", "worktree", "add", "-q", str(worktree)], cwd=repo, check=True)
+
+            scoped = self.sandbox_argv(worktree, git_mode="scoped")
+            common = str((repo / ".git").resolve())
+            self.assertTrue(any(
+                scoped[index:index + 3] == ["--bind", common, common]
+                for index in range(len(scoped) - 2)
+            ))
+            self.assertTrue(any(
+                scoped[index:index + 3] == [
+                    "--setenv", "GIT_CONFIG_VALUE_0", str(worktree.resolve())
+                ]
+                for index in range(len(scoped) - 2)
+            ))
+
+            unscoped = self.sandbox_argv(worktree, git_mode="none")
+            self.assertFalse(any(
+                unscoped[index:index + 3] == ["--bind", common, common]
+                for index in range(len(unscoped) - 2)
+            ))
+
+    def test_scoped_sandbox_commits_through_linked_worktree_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+            (repo / "seed").write_text("s\n")
+            subprocess.run(["git", "add", "seed"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=repo, check=True)
+            worktree = root / "worktree"
+            subprocess.run(["git", "worktree", "add", "-q", str(worktree)], cwd=repo, check=True)
+            note = worktree / "backlog" / "triage" / "note.md"
+            note.parent.mkdir(parents=True)
+            note.write_text("accepted\n")
+
+            for command in (
+                "git status --short",
+                "git add 'backlog/triage/note.md'",
+                "git commit -m 'accept linked worktree'",
+                "git status --short",
+            ):
+                result = subprocess.run(
+                    self.sandbox_argv(
+                        worktree, git_mode="scoped", command=command),
+                    capture_output=True, text=True, check=False)
+                self.assertEqual(0, result.returncode, f"{command}\n{result.stderr}")
+            self.assertFalse(subprocess.run(
+                ["git", "-C", str(worktree), "status", "--porcelain"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip())
 
     def test_boundary_tools_are_always_visible_to_the_model(self) -> None:
         definitions = self.exercise([

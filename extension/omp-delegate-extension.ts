@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -336,11 +336,32 @@ function sandboxDirectories(workspace: string): string[] {
   return directories;
 }
 
+function gitCommonDirectory(workspace: string): string {
+  const result = spawnSync(
+    "git",
+    [
+      "-c", `safe.directory=${workspace}`,
+      "-C", workspace,
+      "rev-parse", "--path-format=absolute", "--git-common-dir",
+    ],
+    {
+      encoding: "utf8",
+      env: { PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" },
+    },
+  );
+  if (result.status !== 0 || !result.stdout.trim()) {
+    throw new Error("Scoped Git metadata could not be resolved for the admitted workspace");
+  }
+  return realpathSync(result.stdout.trim());
+}
+
 export function buildSandboxArgv(command: string, workspaceValue: string): string[] {
   const workspace = realpathSync(workspaceValue);
   const writable = ["workspace-write", "restricted-write"].includes(
     process.env.OMP_DELEGATE_SANDBOX ?? "",
   );
+  const scopedGit = process.env.OMP_DELEGATE_GIT_MODE === "scoped";
+  const commonDirectory = scopedGit ? gitCommonDirectory(workspace) : null;
   const argv = [
     "/usr/bin/bwrap",
     "--die-with-parent",
@@ -356,16 +377,30 @@ export function buildSandboxArgv(command: string, workspaceValue: string): strin
     "--tmpfs", "/tmp",
     "--dir", "/tmp/home",
   ];
-  for (const directory of sandboxDirectories(workspace)) {
+  const directories = new Set(sandboxDirectories(workspace));
+  if (commonDirectory && !withinWorkspace(commonDirectory, workspace)) {
+    for (const directory of sandboxDirectories(commonDirectory)) directories.add(directory);
+  }
+  for (const directory of directories) {
     if (!["/usr", "/etc", "/tmp"].includes(directory)) argv.push("--dir", directory);
+  }
+  if (commonDirectory && !withinWorkspace(commonDirectory, workspace)) {
+    argv.push("--bind", commonDirectory, commonDirectory);
   }
   argv.push(
     writable ? "--bind" : "--ro-bind", workspace, workspace,
     "--chdir", workspace,
     "--setenv", "HOME", "/tmp/home",
     "--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    "/bin/bash", "-lc", command,
   );
+  if (scopedGit) {
+    argv.push(
+      "--setenv", "GIT_CONFIG_COUNT", "1",
+      "--setenv", "GIT_CONFIG_KEY_0", "safe.directory",
+      "--setenv", "GIT_CONFIG_VALUE_0", workspace,
+    );
+  }
+  argv.push("/bin/bash", "-lc", command);
   return argv;
 }
 
@@ -439,19 +474,36 @@ async function runSandboxedBash(
   };
 }
 
-function validFinal(value: unknown): value is {
+type FinalResult = {
   summary: string;
   verification: string[];
   gaps: string[];
   verdict: "MET" | "PARTIALLY MET" | "NOT MET";
-} {
+};
+
+function meaningfulLines(value: string): string[] | null {
+  const lines = value.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines.length > 50 || lines.some((line) => line.length < 4 || line.length > 1_000)) return null;
+  return lines;
+}
+
+function normalizeFinal(value: unknown): FinalResult | null {
   if (!value || typeof value !== "object"
     || !("summary" in value) || !("verification" in value)
-    || !("gaps" in value) || !("verdict" in value)) return false;
-  return typeof value.summary === "string" && value.summary.length > 0
-    && Array.isArray(value.verification) && value.verification.every((item) => typeof item === "string")
-    && Array.isArray(value.gaps) && value.gaps.every((item) => typeof item === "string")
-    && ["MET", "PARTIALLY MET", "NOT MET"].includes(String(value.verdict));
+    || !("gaps" in value) || !("verdict" in value)
+    || typeof value.summary !== "string"
+    || typeof value.verification !== "string"
+    || typeof value.gaps !== "string"
+    || !["MET", "PARTIALLY MET", "NOT MET"].includes(String(value.verdict))) return null;
+  const summary = value.summary.trim();
+  const verification = meaningfulLines(value.verification);
+  const gaps = meaningfulLines(value.gaps);
+  if (summary.length < 20 || summary.length > 4_000 || verification === null || gaps === null) return null;
+  const verdict = value.verdict as FinalResult["verdict"];
+  if (verdict === "MET" && (verification.length === 0 || gaps.length !== 0)) return null;
+  if (verdict === "PARTIALLY MET" && (verification.length === 0 || gaps.length === 0)) return null;
+  if (verdict === "NOT MET" && gaps.length === 0) return null;
+  return { summary, verification, gaps, verdict };
 }
 
 export default function ompDelegateExtension(pi: PiApi): void {
@@ -497,11 +549,11 @@ export default function ompDelegateExtension(pi: PiApi): void {
   pi.registerTool({
     name: "broker_finalize",
     label: "Finalize broker result",
-    description: "Record the broker's required typed outcome. Call exactly once, after all edits and verification.",
+    description: "Record the broker's required typed outcome. Call exactly once, after all edits and verification. Verification and gaps are newline-separated text, not arrays.",
     parameters: z.object({
-      summary: z.string(),
-      verification: z.array(z.string()),
-      gaps: z.array(z.string()),
+      summary: z.string().describe("Meaningful outcome summary, at least 20 characters"),
+      verification: z.string().describe("Newline-separated verification statements; required for MET and PARTIALLY MET"),
+      gaps: z.string().describe("Newline-separated gaps; required for PARTIALLY MET and NOT MET; empty for MET"),
       verdict: z.enum(["MET", "PARTIALLY MET", "NOT MET"]),
     }),
     approval: "write",
@@ -514,11 +566,12 @@ export default function ompDelegateExtension(pi: PiApi): void {
         return { content: [{ type: "text", text: "Final result was already recorded" }], isError: true };
       }
       const finalPath = process.env.OMP_DELEGATE_FINAL_PATH;
-      if (!finalPath || !validFinal(params)) {
-        return { content: [{ type: "text", text: "Final result is invalid or has no broker-owned destination" }], isError: true };
+      const final = normalizeFinal(params);
+      if (!finalPath || final === null) {
+        return { content: [{ type: "text", text: "Final result rejected: use a meaningful summary; newline-separated verification/gaps; MET requires verification and no gaps; PARTIALLY MET requires both; NOT MET requires gaps" }], isError: true };
       }
       const temporary = `${finalPath}.tmp-${process.pid}`;
-      writeFileSync(temporary, `${JSON.stringify(params)}\n`, { mode: 0o600, flag: "wx" });
+      writeFileSync(temporary, `${JSON.stringify(final)}\n`, { mode: 0o600, flag: "wx" });
       renameSync(temporary, finalPath);
       chmodSync(finalPath, 0o600);
       finalized = true;
