@@ -56,6 +56,7 @@ const RESEARCH_TOOLS: Record<string, true> = {
   backlog_search: true,
   backlog_fetch: true,
   todo: true,
+  yield: true,
   broker_finalize: true,
 };
 const SEARCH_ENDPOINT = "http://127.0.0.1:8888/search";

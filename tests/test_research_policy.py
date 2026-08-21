@@ -212,6 +212,7 @@ console.log(JSON.stringify(output));''')
             {"toolName": "backlog_fetch", "input": {"url": "https://example.com"}},
             {"toolName": "read", "input": {"path": "runs/manifest.json"}},
             {"toolName": "write", "input": {"path": "runs/manifest.json", "content": "{}"}},
+            {"toolName": "yield", "input": {"summary": "worker result"}},
             {"toolName": "hub", "input": {"op": "list"}},
             {"toolName": "web_search", "input": {"query": "unbounded"}},
         ], caller=RESEARCH, sandbox="restricted-write",
@@ -221,8 +222,9 @@ console.log(JSON.stringify(output));''')
         self.assertIsNone(results[2])
         self.assertIsNone(results[3])
         self.assertIsNone(results[4])
-        self.assertTrue(results[5]["block"])
+        self.assertIsNone(results[5])
         self.assertTrue(results[6]["block"])
+        self.assertTrue(results[7]["block"])
 
     def test_research_caller_cannot_shadow_agents_even_if_sandbox_drifts(self) -> None:
         [result] = self.exercise([
