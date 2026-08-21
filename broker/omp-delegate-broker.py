@@ -299,7 +299,7 @@ def omp_environment(
     final_path: Path,
     request: Request,
 ) -> dict[str, str]:
-    return {
+    env = {
         "HOME": os.environ.get("HERMES_OMP_HOME", str(Path.home())),
         "PATH": os.environ.get("HERMES_OMP_PATH", os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")),
         "LANG": base.get("LANG", "C.UTF-8"),
@@ -312,6 +312,13 @@ def omp_environment(
         "OMP_DELEGATE_GIT_MODE": request.git_mode,
         "OMP_DELEGATE_CREATE_ONLY": "1" if request.create_only else "0",
     }
+    if request.git_mode == "scoped":
+        env.update({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": str(request.workspace.resolve()),
+        })
+    return env
 
 
 def _fallback_models() -> tuple[str, ...]:

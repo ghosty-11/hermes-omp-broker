@@ -91,6 +91,23 @@ class BrokerPolicyTest(unittest.TestCase):
                 command[:5],
             )
 
+    def test_scoped_child_git_trusts_only_its_exact_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            policy = root / "policy.json"
+            policy.write_text(json.dumps({"repositories": {}}))
+            module = self._load_broker(policy, root / "jobs")
+            request = module.Request(
+                "req", "task", "repo", "caller", root, "restricted-write",
+                "provider/model", "prompt", 30, (), ("backlog/**",),
+                "scoped", (), False,
+            )
+            env = module.omp_environment(
+                {}, final_path=root / "final.json", request=request)
+            self.assertEqual("1", env["GIT_CONFIG_COUNT"])
+            self.assertEqual("safe.directory", env["GIT_CONFIG_KEY_0"])
+            self.assertEqual(str(root), env["GIT_CONFIG_VALUE_0"])
+
     def test_a_nested_directory_of_the_checkout_is_not_a_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
