@@ -26,7 +26,7 @@ BROKER = ROOT / "broker/omp-delegate-broker.py"
 
 
 class ChildUmaskTest(unittest.TestCase):
-    def _run_child(self, sandbox: str) -> int:
+    def _run_child(self, sandbox: str, *, git_mode: str = "none") -> int:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             workspace = root / "repo"
@@ -37,7 +37,7 @@ class ChildUmaskTest(unittest.TestCase):
                 "callers": {"delegate_to_omp": {
                     "repositories": ["repo"], "sandbox": sandbox,
                     "read_paths": [], "write_patterns": ["**"],
-                    "git_mode": "none", "skills": [],
+                    "git_mode": git_mode, "skills": [],
                 }},
             }))
             fake_omp = root / "fake-omp"
@@ -73,13 +73,21 @@ class ChildUmaskTest(unittest.TestCase):
             return stat.S_IMODE(made.stat().st_mode)
 
     def test_restricted_write_child_writes_group_readable_files(self) -> None:
-        mode = self._run_child("restricted-write")
+        mode = self._run_child("restricted-write", git_mode="scoped")
         self.assertTrue(mode & stat.S_IRGRP,
                         f"restricted-write child file is not group-readable: {oct(mode)}")
 
-    def test_workspace_write_child_keeps_the_inherited_umask(self) -> None:
-        mode = self._run_child("workspace-write")
+    def test_scoped_git_workspace_write_child_writes_group_readable_files(self) -> None:
+        # A scoped-git child works a linked worktree whose refs and index the
+        # hermes worker must read next (proven live 2026-08-24: a 600 branch
+        # ref broke the worker's evidence read on the same worktree).
+        mode = self._run_child("workspace-write", git_mode="scoped")
+        self.assertTrue(mode & stat.S_IRGRP,
+                        f"scoped-git child file is not group-readable: {oct(mode)}")
+
+    def test_plain_workspace_write_child_keeps_the_inherited_umask(self) -> None:
+        mode = self._run_child("workspace-write", git_mode="none")
         self.assertFalse(mode & stat.S_IRGRP,
-                         f"workspace-write child unexpectedly widened: {oct(mode)}")
+                         f"plain workspace-write child unexpectedly widened: {oct(mode)}")
 if __name__ == "__main__":
     unittest.main(verbosity=2)

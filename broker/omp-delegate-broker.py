@@ -505,7 +505,13 @@ def start_omp_process(
             # Scoped to restricted-write: those callers exist precisely to
             # produce group-consumed artefacts; workspace-write children keep
             # the inherited umask. Credentials stay 0600 explicitly.
-            umask=0o002 if request.sandbox == "restricted-write" else -1,
+            # A scoped-git child (2026-08-24) joins that exception: it works a
+            # linked worktree whose refs, index and logs the hermes worker
+            # must read and advance next, so its git metadata has to stay
+            # group-accessible across the two uids.
+            umask=0o002 if (
+                request.sandbox == "restricted-write"
+                or request.git_mode == "scoped") else -1,
         )
     finally:
         os.close(credential_fd)
