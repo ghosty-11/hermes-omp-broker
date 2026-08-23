@@ -22,6 +22,12 @@ RESPONSE_FIELDS = {
     "version", "exit_code", "stdout", "stderr", "timed_out",
     "process_group_clear", "final", "request_id",
 }
+STATUS_JOB_FIELDS = {
+    "request_id", "task_id", "repository", "caller", "status", "result",
+    "created_at", "updated_at",
+}
+STATUS_SUCCESS_FIELDS = {"version", "op", "ok", "job"}
+STATUS_ERROR_FIELDS = {"version", "op", "ok", "error"}
 FINAL_FIELDS = {"summary", "verification", "gaps", "verdict"}
 OPTIONAL_FINAL_FIELDS = {"served_model"}
 FINAL_VERDICTS = {"MET", "PARTIALLY MET", "NOT MET"}
@@ -228,6 +234,35 @@ def resolve_policy(env: Mapping[str, str], cwd: Path) -> Policy:
     )
 
 
+def resolve_status_identity(env: Mapping[str, str]) -> tuple[str, str]:
+    caller = env.get("OMP_INVOKED_BY", "delegate_to_omp")
+    repository = env.get("OMP_REPOSITORY")
+    policy_path = Path(env.get(
+        "HERMES_OMP_POLICY",
+        str(Path(__file__).with_name("policy.json")),
+    ))
+    try:
+        value = json.loads(policy_path.read_text())
+    except (OSError, ValueError, TypeError) as exc:
+        raise InvocationError("status policy is unavailable") from exc
+    repositories = value.get("repositories") if isinstance(value, dict) else None
+    callers = value.get("callers") if isinstance(value, dict) else None
+    caller_policy = callers.get(caller) if isinstance(callers, dict) else None
+    allowed = caller_policy.get("repositories") if isinstance(caller_policy, dict) else None
+    if (
+        not isinstance(repository, str)
+        or not repository
+        or not isinstance(repositories, dict)
+        or not isinstance(repositories.get(repository), dict)
+        or not isinstance(repositories.get(repository, {}).get("path"), str)
+        or not isinstance(allowed, list)
+        or not all(isinstance(item, str) for item in allowed)
+        or repository not in allowed
+    ):
+        raise InvocationError("status caller or repository is not admitted")
+    return caller, repository
+
+
 def _recv_exact(conn: socket.socket, size: int) -> bytes:
     chunks = bytearray()
     while len(chunks) < size:
@@ -275,6 +310,83 @@ def validate_response(value: object) -> dict[str, object]:
     if not _valid_final(value.get("final")):
         raise InvocationError("OMP worker did not produce a typed final result")
     return value
+
+
+def validate_status_response(
+    value: object,
+    *,
+    request_id: str,
+    caller: str,
+    repository: str,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or value.get("version") != 1 or value.get("op") != "status":
+        raise InvocationError("broker returned an invalid status response contract")
+    if set(value) == STATUS_ERROR_FIELDS:
+        if value.get("ok") is not False or value.get("error") != "job unavailable":
+            raise InvocationError("broker returned an invalid status response contract")
+        raise InvocationError("job unavailable")
+    if set(value) != STATUS_SUCCESS_FIELDS or value.get("ok") is not True:
+        raise InvocationError("broker returned an invalid status response contract")
+    job = value.get("job")
+    if not isinstance(job, dict) or set(job) != STATUS_JOB_FIELDS:
+        raise InvocationError("broker returned an invalid status job")
+    if not all(
+        isinstance(job.get(name), str) and bool(job[name])
+        for name in ("request_id", "task_id", "repository", "caller", "status")
+    ):
+        raise InvocationError("broker returned invalid status job text fields")
+    if (
+        job["request_id"] != request_id
+        or job["caller"] != caller
+        or job["repository"] != repository
+    ):
+        raise InvocationError("broker returned a mismatched status job")
+    if not all(
+        isinstance(job.get(name), int) and not isinstance(job[name], bool)
+        for name in ("created_at", "updated_at")
+    ):
+        raise InvocationError("broker returned invalid status job timestamps")
+    result = job.get("result")
+    if result is not None and not isinstance(result, dict):
+        raise InvocationError("broker returned an invalid status job result")
+    return job
+
+
+def request_status(
+    socket_path: Path,
+    *,
+    request_id: str,
+    caller: str,
+    repository: str,
+) -> dict[str, object]:
+    if not request_id:
+        raise InvocationError("status request identifier is empty")
+    request = {
+        "version": 1,
+        "op": "status",
+        "request_id": request_id,
+        "caller": caller,
+        "repository": repository,
+    }
+    payload = json.dumps(request, separators=(",", ":")).encode()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(30)
+            conn.connect(str(socket_path))
+            conn.sendall(struct.pack("!I", len(payload)) + payload)
+            conn.shutdown(socket.SHUT_WR)
+            size = struct.unpack("!I", _recv_exact(conn, 4))[0]
+            if size <= 0 or size > MAX_RESPONSE_BYTES:
+                raise InvocationError("broker response is outside the size bound")
+            response = json.loads(_recv_exact(conn, size))
+    except (OSError, json.JSONDecodeError, struct.error) as exc:
+        raise InvocationError(f"OMP broker request failed: {exc}") from exc
+    return validate_status_response(
+        response,
+        request_id=request_id,
+        caller=caller,
+        repository=repository,
+    )
 
 
 def invoke_broker(socket_path: Path, policy: Policy, prompt: str) -> dict[str, object]:
@@ -349,6 +461,45 @@ def format_json_response(
 
 def main() -> int:
     args = sys.argv[1:]
+    if "--status" in args:
+        if args.count("--status") != 1:
+            print("omp-invoke: expected --status REQUEST_ID and optional --json", file=sys.stderr)
+            return 2
+        status_index = args.index("--status")
+        if status_index + 1 >= len(args):
+            print("omp-invoke: expected --status REQUEST_ID and optional --json", file=sys.stderr)
+            return 2
+        request_id = args[status_index + 1]
+        remaining = args[:status_index] + args[status_index + 2:]
+        if remaining not in ([], ["--json"]):
+            print("omp-invoke: expected --status REQUEST_ID and optional --json", file=sys.stderr)
+            return 2
+        try:
+            caller, repository = resolve_status_identity(os.environ)
+            socket_path = Path(os.environ.get(
+                "OMP_DELEGATE_BROKER_SOCKET",
+                str(_policy_socket(os.environ)),
+            ))
+            job = request_status(
+                socket_path,
+                request_id=request_id,
+                caller=caller,
+                repository=repository,
+            )
+            output = (
+                json.dumps(job, separators=(",", ":")) + "\n"
+                if remaining
+                else (
+                    f"request={job['request_id']} task={job['task_id']} "
+                    f"status={job['status']}\n"
+                )
+            )
+            sys.stdout.write(output)
+        except InvocationError as exc:
+            print(f"omp-invoke: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
     json_output = bool(args and args[0] == "--json")
     if json_output:
         args.pop(0)

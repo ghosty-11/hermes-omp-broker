@@ -26,6 +26,65 @@ A production bridge must:
 
 The JSON Schema in [`schemas/coding-job.schema.json`](../schemas/coding-job.schema.json) defines the protocol-v1 wire request and response. Authorization belongs in the broker, not in the schema. The public request `timeout` maximum is 3600 seconds so a policy-raised ceiling can travel on the wire; the broker still applies the caller's admitted bound, default 810.
 
+### Protocol operations
+
+Protocol version 1 supports invoke and status operations. An invoke request has the
+existing request shape in the normative schema and does not include an `op` field. The
+broker discriminates the request shape before it validates the invoke fields. Adding an
+`op` field to an invoke request is invalid.
+
+A status request is one bounded frame with exactly these fields:
+
+```json
+{
+  "version": 1,
+  "op": "status",
+  "request_id": "request-17",
+  "caller": "planner",
+  "repository": "example-service"
+}
+```
+
+The broker admits `caller` and `repository` through server-owned policy, then reads the
+durable record for `request_id`. A status request does not start OMP, mutate the job, run
+orphan recovery, or add execution or audit records. The broker returns a job only when the
+stored caller and repository match the request.
+
+A successful status response has exactly this shape:
+
+```json
+{
+  "version": 1,
+  "op": "status",
+  "ok": true,
+  "job": {
+    "request_id": "request-17",
+    "task_id": "task-17",
+    "repository": "example-service",
+    "caller": "planner",
+    "status": "completed",
+    "result": null,
+    "created_at": 1777000000,
+    "updated_at": 1777000001
+  }
+}
+```
+
+The `job` object contains only the fields shown. In particular, it does not expose a
+stored process-group identifier. `result` is either the stored invoke response or `null`.
+
+An unknown job, an unauthorized caller or repository, and a caller or repository mismatch
+produce the same response:
+
+```json
+{"version":1,"op":"status","ok":false,"error":"job unavailable"}
+```
+
+The client command `omp-invoke --status REQUEST_ID` takes caller and repository identity
+from `OMP_INVOKED_BY` and `OMP_REPOSITORY`. It validates that pair against policy before it
+opens the broker socket. The status path does not read a prompt or resolve a workspace or
+model. Add `--json` before or after `--status REQUEST_ID` to print the job object as JSON.
+
 ## OMP integration modes
 
 OMP exposes four useful entry points:

@@ -2,10 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/ghosty-11/hermes-omp-broker/main/schemas/coding-job.schema.json",
   "title": "Hermes to OMP broker wire protocol",
-  "description": "Protocol v1 request and response frames. Authentication and repository, caller, model, sandbox, timeout, path, tool, and credential authorization remain server-owned policy.",
+  "description": "Protocol v1 invoke and read-only status request and response frames. Authentication and repository, caller, model, sandbox, timeout, path, tool, and credential authorization remain server-owned policy.",
   "oneOf": [
     { "$ref": "#/$defs/request" },
-    { "$ref": "#/$defs/response" }
+    { "$ref": "#/$defs/response" },
+    { "$ref": "#/$defs/statusRequest" },
+    { "$ref": "#/$defs/statusSuccess" },
+    { "$ref": "#/$defs/statusError" }
   ],
   "$defs": {
     "request": {
@@ -71,6 +74,88 @@
           ]
         },
         "request_id": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "statusRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "op", "request_id", "caller", "repository"],
+      "properties": {
+        "version": { "const": 1 },
+        "op": { "const": "status" },
+        "request_id": { "$ref": "#/$defs/id" },
+        "caller": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "repository": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "description": "Server-owned allowlist key, never a filesystem path."
+        }
+      }
+    },
+    "statusSuccess": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "op", "ok", "job"],
+      "properties": {
+        "version": { "const": 1 },
+        "op": { "const": "status" },
+        "ok": { "const": true },
+        "job": { "$ref": "#/$defs/statusJob" }
+      }
+    },
+    "statusError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "op", "ok", "error"],
+      "properties": {
+        "version": { "const": 1 },
+        "op": { "const": "status" },
+        "ok": { "const": false },
+        "error": { "const": "job unavailable" }
+      }
+    },
+    "statusJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "task_id",
+        "repository",
+        "caller",
+        "status",
+        "result",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/id" },
+        "task_id": { "$ref": "#/$defs/id" },
+        "repository": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        },
+        "caller": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "status": {
+          "enum": [
+            "pending",
+            "running",
+            "completed",
+            "failed",
+            "rejected",
+            "cancelled",
+            "timed_out",
+            "orphaned",
+            "delivery_failed"
+          ]
+        },
+        "result": {
+          "oneOf": [
+            { "$ref": "#/$defs/response" },
+            { "type": "null" }
+          ]
+        },
+        "created_at": { "type": "integer", "minimum": 0 },
+        "updated_at": { "type": "integer", "minimum": 0 }
       }
     },
     "final": {

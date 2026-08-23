@@ -97,6 +97,11 @@ def _load_policy() -> tuple[
 
 ALLOWED_WORKSPACES, ALLOWED_SANDBOXES, REPOSITORY_PATHS, CALLER_POLICIES = _load_policy()
 REQUEST_FIELDS = {"version", "request_id", "task_id", "repository", "caller", "workspace", "sandbox", "model", "prompt", "timeout"}
+STATUS_REQUEST_FIELDS = {"version", "op", "request_id", "caller", "repository"}
+STATUS_JOB_FIELDS = (
+    "request_id", "task_id", "repository", "caller", "status", "result",
+    "created_at", "updated_at",
+)
 RESPONSE_FIELDS = {
     "version", "exit_code", "stdout", "stderr", "timed_out",
     "process_group_clear", "final", "request_id",
@@ -154,6 +159,13 @@ class Request:
     fallback_selectors: tuple[str, ...] = ()
 
 
+@dataclasses.dataclass(frozen=True)
+class StatusRequest:
+    request_id: str
+    caller: str
+    repository: str
+
+
 def git_common_dir(path: Path) -> Path | None:
     """The shared .git of a checkout or worktree, or None if it is not git."""
     try:
@@ -207,10 +219,36 @@ def is_worktree_of(candidate: Path, admitted: Path) -> bool:
     return left is not None and left == right
 
 
-def validate_request(value: object, *, peer_uid: int) -> Request:
+def _validate_peer_uid(peer_uid: int) -> None:
     allowed_uid = int(os.environ.get("HERMES_OMP_CALLER_UID", str(os.getuid())))
     if peer_uid != allowed_uid:
         raise ProtocolError("peer uid is not the admitted local identity")
+
+
+def validate_status_request(value: object, *, peer_uid: int) -> StatusRequest:
+    _validate_peer_uid(peer_uid)
+    if not isinstance(value, dict) or set(value) != STATUS_REQUEST_FIELDS:
+        raise ProtocolError("status request fields do not match protocol v1")
+    if value.get("version") != 1 or value.get("op") != "status":
+        raise ProtocolError("unsupported protocol operation or version")
+    if not all(
+        isinstance(value.get(name), str) and bool(value[name])
+        for name in ("request_id", "caller", "repository")
+    ):
+        raise ProtocolError("status request string field is empty or has the wrong type")
+    return StatusRequest(value["request_id"], value["caller"], value["repository"])
+
+
+def parse_request(value: object, *, peer_uid: int) -> Request | StatusRequest:
+    if isinstance(value, dict) and "op" in value:
+        if value.get("op") != "status":
+            raise ProtocolError("unsupported protocol operation")
+        return validate_status_request(value, peer_uid=peer_uid)
+    return validate_request(value, peer_uid=peer_uid)
+
+
+def validate_request(value: object, *, peer_uid: int) -> Request:
+    _validate_peer_uid(peer_uid)
     if not isinstance(value, dict) or set(value) != REQUEST_FIELDS:
         raise ProtocolError("request fields do not match protocol v1")
     if value.get("version") != 1:
@@ -613,6 +651,42 @@ def _error_response(message: str, *, request_id: str = "") -> dict[str, object]:
     }
 
 
+def _status_error_response() -> dict[str, object]:
+    return {
+        "version": 1,
+        "op": "status",
+        "ok": False,
+        "error": "job unavailable",
+    }
+
+
+def read_status(request: StatusRequest) -> dict[str, object]:
+    caller_policy = CALLER_POLICIES.get(request.caller)
+    repositories = caller_policy.get("repositories") if caller_policy else None
+    if (
+        not isinstance(repositories, list)
+        or request.repository not in repositories
+        or request.repository not in REPOSITORY_PATHS
+    ):
+        return _status_error_response()
+    try:
+        record = JOB_STORE.get(request.request_id)
+        if (
+            record.get("caller") != request.caller
+            or record.get("repository") != request.repository
+        ):
+            return _status_error_response()
+        job = {name: record[name] for name in STATUS_JOB_FIELDS}
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return _status_error_response()
+    return {
+        "version": 1,
+        "op": "status",
+        "ok": True,
+        "job": job,
+    }
+
+
 def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
     request_id = request.request_id
     JOB_STORE.create(
@@ -750,37 +824,50 @@ def _send_frame(conn: socket.socket, value: dict[str, object]) -> None:
     conn.settimeout(FRAME_TIMEOUT)
     payload = json.dumps(value, separators=(",", ":")).encode()
     if len(payload) > MAX_RESPONSE_BYTES:
-        payload = json.dumps(_error_response("response exceeded size bound"), separators=(",", ":")).encode()
+        fallback = (
+            _status_error_response()
+            if value.get("op") == "status"
+            else _error_response("response exceeded size bound")
+        )
+        payload = json.dumps(fallback, separators=(",", ":")).encode()
     conn.sendall(struct.pack("!I", len(payload)) + payload)
 
 
-def receive_request(conn: socket.socket) -> Request:
+def receive_request(conn: socket.socket) -> Request | StatusRequest:
     deadline = time.monotonic() + FRAME_TIMEOUT
     size = struct.unpack("!I", _recv_exact(conn, 4, deadline))[0]
     if size <= 0 or size > MAX_REQUEST_BYTES:
         raise ProtocolError("request frame is outside size bound")
     value = json.loads(_recv_exact(conn, size, deadline))
-    request = validate_request(value, peer_uid=_peer_uid(conn))
+    request = parse_request(value, peer_uid=_peer_uid(conn))
     conn.settimeout(None)
     return request
 
 
 def serve(listener: socket.socket) -> None:
-    JOB_STORE.recover_orphans()
+    recovered_orphans = False
     while True:
         conn, _ = listener.accept()
         with conn:
             request_id = ""
+            invocation = False
             try:
                 request = receive_request(conn)
                 request_id = request.request_id
-                response = run_request(request, conn)
+                if isinstance(request, StatusRequest):
+                    response = read_status(request)
+                else:
+                    invocation = True
+                    if not recovered_orphans:
+                        JOB_STORE.recover_orphans()
+                        recovered_orphans = True
+                    response = run_request(request, conn)
             except (OSError, ProtocolError, json.JSONDecodeError, struct.error, ValueError) as exc:
                 response = _error_response(str(exc), request_id=request_id)
             try:
                 _send_frame(conn, response)
             except OSError:
-                if request_id:
+                if invocation and request_id:
                     try:
                         JOB_STORE.delivery_failed(request_id)
                     except (OSError, ValueError):
