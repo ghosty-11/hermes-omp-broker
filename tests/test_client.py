@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -201,5 +202,143 @@ class TestOmpInvoke(unittest.TestCase):
         self.assertNotIn("stderr", value)
 
 
+
+    def test_trusted_fake_v2_success_sends_only_opaque_lease_and_spends_nothing_client_side(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            socket_path = Path(td) / "broker.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            listener.listen(1)
+            observed: dict[str, object] = {}
+
+            def serve() -> None:
+                conn, _ = listener.accept()
+                with conn:
+                    size = struct.unpack("!I", conn.recv(4))[0]
+                    payload = bytearray()
+                    while len(payload) < size:
+                        payload.extend(conn.recv(size - len(payload)))
+                    observed.update(json.loads(payload))
+                    response = {
+                        "version": 2,
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "timed_out": False,
+                        "process_group_clear": True,
+                        "final": {
+                            "summary": "trusted fixture complete",
+                            "verification": ["fake broker exercised"],
+                            "gaps": [],
+                            "verdict": "MET",
+                        },
+                        "request_id": "server-fixed-request",
+                    }
+                    body = json.dumps(response).encode()
+                    conn.sendall(struct.pack("!I", len(body)) + body)
+
+            worker = threading.Thread(target=serve)
+            worker.start()
+            response = self.module.invoke_broker_v2(
+                socket_path, "opaque-lease-handle", "execute")
+            worker.join(timeout=2)
+            listener.close()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual({
+                "version": 2,
+                "op": "execute",
+                "lease_id": "opaque-lease-handle",
+            }, observed)
+            self.assertEqual("server-fixed-request", response["request_id"])
+
+    def test_v2_status_uses_the_same_minimal_schema(self) -> None:
+        sent: list[dict[str, object]] = []
+
+        class FakeSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def connect(self, _path):
+                return None
+
+            def settimeout(self, _timeout):
+                return None
+
+            def sendall(self, frame):
+                size = struct.unpack("!I", frame[:4])[0]
+                sent.append(json.loads(frame[4:4 + size]))
+
+            def shutdown(self, _how):
+                return None
+
+            def recv(self, size):
+                response = json.dumps({
+                    "version": 2, "op": "status", "ok": False,
+                    "error": "job unavailable",
+                }).encode()
+                frame = struct.pack("!I", len(response)) + response
+                chunk, self.buffer = frame[:size], frame[size:]
+                self.recv = lambda count: self._next(count)
+                return chunk
+
+            def _next(self, size):
+                chunk, self.buffer = self.buffer[:size], self.buffer[size:]
+                return chunk
+        with mock.patch.object(self.module.socket, "socket", return_value=FakeSocket()):
+            with self.assertRaises(self.module.InvocationError) as raised:
+                self.module.invoke_broker_v2(Path("/fixed.sock"), "lease", "status")
+        self.assertEqual("job unavailable", str(raised.exception))
+        self.assertEqual(
+            [{"version": 2, "op": "status", "lease_id": "lease"}], sent)
+
+
+    def test_v2_health_sends_exact_no_spend_canary_and_validates_exact_response(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            socket_path = Path(td) / "broker.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            listener.listen(1)
+            observed: dict[str, object] = {}
+
+            def serve() -> None:
+                conn, _ = listener.accept()
+                with conn:
+                    size = struct.unpack("!I", conn.recv(4))[0]
+                    payload = bytearray()
+                    while len(payload) < size:
+                        payload.extend(conn.recv(size - len(payload)))
+                    observed.update(json.loads(payload))
+                    response = {"version": 2, "op": "health", "ok": True}
+                    body = json.dumps(response).encode()
+                    conn.sendall(struct.pack("!I", len(body)) + body)
+
+            worker = threading.Thread(target=serve)
+            worker.start()
+            self.assertEqual(
+                {"version": 2, "op": "health", "ok": True},
+                self.module.health_broker_v2(socket_path),
+            )
+            worker.join(timeout=2)
+            listener.close()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual({"version": 2, "op": "health"}, observed)
+
+            with self.assertRaises(self.module.InvocationError) as unavailable:
+                self.module.validate_health_response({
+                    "version": 2, "op": "health", "ok": False,
+                    "error": "endpoint unavailable",
+                })
+            self.assertEqual("endpoint unavailable", str(unavailable.exception))
+            for invalid in (
+                {"version": 2, "op": "health", "ok": True, "extra": True},
+                {"version": 2, "op": "health"},
+                {"version": 1, "op": "health", "ok": True},
+            ):
+                with self.subTest(invalid=invalid):
+                    with self.assertRaises(self.module.InvocationError):
+                        self.module.validate_health_response(invalid)
 if __name__ == "__main__":
     unittest.main(verbosity=2)

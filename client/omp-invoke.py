@@ -18,6 +18,7 @@ BROKER_SOCKET = Path(os.environ.get("HERMES_OMP_BROKER_SOCKET", "run/omp-broker.
 MODEL = os.environ.get("HERMES_OMP_MODEL", "provider/model")
 MAX_PROMPT_CHARS = 500_000
 MAX_RESPONSE_BYTES = 8_000_000
+ABSOLUTE_V2_TIMEOUT = 3630.0
 RESPONSE_FIELDS = {
     "version", "exit_code", "stdout", "stderr", "timed_out",
     "process_group_clear", "final", "request_id",
@@ -31,6 +32,8 @@ STATUS_ERROR_FIELDS = {"version", "op", "ok", "error"}
 FINAL_FIELDS = {"summary", "verification", "gaps", "verdict"}
 OPTIONAL_FINAL_FIELDS = {"served_model"}
 FINAL_VERDICTS = {"MET", "PARTIALLY MET", "NOT MET"}
+HEALTH_SUCCESS_FIELDS = {"version", "op", "ok"}
+HEALTH_ERROR_FIELDS = {"version", "op", "ok", "error"}
 
 
 class InvocationError(RuntimeError):
@@ -295,8 +298,10 @@ def _valid_final(value: object) -> bool:
     return True
 
 
-def validate_response(value: object) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != RESPONSE_FIELDS or value.get("version") != 1:
+def validate_response(
+    value: object, *, version: int = 1,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != RESPONSE_FIELDS or value.get("version") != version:
         raise InvocationError("broker returned an invalid response contract")
     if not isinstance(value.get("exit_code"), int):
         raise InvocationError("broker returned an invalid exit code")
@@ -418,6 +423,97 @@ def invoke_broker(socket_path: Path, policy: Policy, prompt: str) -> dict[str, o
     except (OSError, json.JSONDecodeError, struct.error) as exc:
         raise InvocationError(f"OMP broker request failed: {exc}") from exc
     return validate_response(response)
+
+def validate_health_response(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise InvocationError("broker returned an invalid health response contract")
+    if set(value) == HEALTH_SUCCESS_FIELDS:
+        if (
+            value.get("version") == 2
+            and value.get("op") == "health"
+            and value.get("ok") is True
+        ):
+            return value
+        raise InvocationError("broker returned an invalid health response contract")
+    if set(value) == HEALTH_ERROR_FIELDS:
+        if (
+            value.get("version") == 2
+            and value.get("op") == "health"
+            and value.get("ok") is False
+            and value.get("error") == "endpoint unavailable"
+        ):
+            raise InvocationError("endpoint unavailable")
+    raise InvocationError("broker returned an invalid health response contract")
+
+
+def health_broker_v2(socket_path: Path) -> dict[str, object]:
+    payload = json.dumps(
+        {"version": 2, "op": "health"}, separators=(",", ":")).encode()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(30)
+            conn.connect(str(socket_path))
+            conn.sendall(struct.pack("!I", len(payload)) + payload)
+            conn.shutdown(socket.SHUT_WR)
+            size = struct.unpack("!I", _recv_exact(conn, 4))[0]
+            if size <= 0 or size > MAX_RESPONSE_BYTES:
+                raise InvocationError("broker response is outside the size bound")
+            response = json.loads(_recv_exact(conn, size))
+    except (OSError, json.JSONDecodeError, struct.error) as exc:
+        raise InvocationError(f"OMP broker request failed: {exc}") from exc
+    return validate_health_response(response)
+
+
+def invoke_broker_v2(
+    socket_path: Path, lease_id: str, op: str,
+) -> dict[str, object]:
+    """Redeem or inspect a server-fixed lease without sending authority text."""
+    if not isinstance(lease_id, str) or not lease_id or op not in {"execute", "status"}:
+        raise InvocationError("invalid protocol v2 lease request")
+    request = {"version": 2, "op": op, "lease_id": lease_id}
+    payload = json.dumps(request, separators=(",", ":")).encode()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(ABSOLUTE_V2_TIMEOUT)
+            conn.connect(str(socket_path))
+            conn.sendall(struct.pack("!I", len(payload)) + payload)
+            conn.shutdown(socket.SHUT_WR)
+            size = struct.unpack("!I", _recv_exact(conn, 4))[0]
+            if size <= 0 or size > MAX_RESPONSE_BYTES:
+                raise InvocationError("broker response is outside the size bound")
+            response = json.loads(_recv_exact(conn, size))
+    except (OSError, json.JSONDecodeError, struct.error) as exc:
+        raise InvocationError(f"OMP broker request failed: {exc}") from exc
+    if op == "execute":
+        return validate_response(response, version=2)
+    if (
+        not isinstance(response, dict)
+        or response.get("version") != 2
+        or response.get("op") != "status"
+    ):
+        raise InvocationError("broker returned an invalid status response contract")
+    if set(response) == STATUS_ERROR_FIELDS:
+        if response.get("ok") is False and response.get("error") == "job unavailable":
+            raise InvocationError("job unavailable")
+        raise InvocationError("broker returned an invalid status response contract")
+    if set(response) != STATUS_SUCCESS_FIELDS or response.get("ok") is not True:
+        raise InvocationError("broker returned an invalid status response contract")
+    job = response.get("job")
+    if not isinstance(job, dict) or set(job) != STATUS_JOB_FIELDS:
+        raise InvocationError("broker returned an invalid status job")
+    if not all(
+        isinstance(job.get(name), str) and bool(job[name])
+        for name in ("request_id", "task_id", "repository", "caller", "status")
+    ):
+        raise InvocationError("broker returned invalid status job text fields")
+    if not all(
+        isinstance(job.get(name), int) and not isinstance(job[name], bool)
+        for name in ("created_at", "updated_at")
+    ):
+        raise InvocationError("broker returned invalid status job timestamps")
+    if job.get("result") is not None and not isinstance(job["result"], dict):
+        raise InvocationError("broker returned an invalid status job result")
+    return job
 
 
 def format_response(response: Mapping[str, object], *, caller: str) -> str:

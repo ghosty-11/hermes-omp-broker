@@ -23,9 +23,9 @@ from pathlib import Path
 from typing import Mapping
 
 try:
-    from broker.lifecycle import JobStore
+    from broker.lifecycle import JobStore, LeaseStore, LeaseUnavailable
 except ModuleNotFoundError:
-    from lifecycle import JobStore
+    from lifecycle import JobStore, LeaseStore, LeaseUnavailable
 
 
 POLICY_FILE = Path(os.environ.get("HERMES_OMP_POLICY", "policy.json"))
@@ -44,6 +44,80 @@ MAX_TIMEOUT = 810.0
 ABSOLUTE_MAX_TIMEOUT = 3600.0
 FRAME_TIMEOUT = 5.0
 JOB_STORE = JobStore(Path(os.environ.get("HERMES_OMP_JOB_DIR", "state/jobs")))
+
+
+def _load_lease_stores() -> dict[str, LeaseStore]:
+    raw = os.environ.get("HERMES_OMP_LEASE_DIRS", "")
+    if not raw:
+        return {}
+    stores: dict[str, LeaseStore] = {}
+    for item in raw.split(","):
+        endpoint, separator, directory = item.partition("=")
+        path = Path(directory)
+        if (
+            not separator
+            or not endpoint
+            or not all(char.isalnum() or char in "_-" for char in endpoint)
+            or endpoint in stores
+            or not path.is_absolute()
+            or not path.is_dir()
+            or path.is_symlink()
+        ):
+            raise SystemExit(
+                "omp-delegate-broker: invalid HERMES_OMP_LEASE_DIRS mapping")
+        identity = ENDPOINT_IDENTITIES.get(endpoint)
+        if identity is None:
+            raise SystemExit(
+                "omp-delegate-broker: lease store has no endpoint user")
+        stores[endpoint] = LeaseStore(
+            path,
+            issuer_uid=identity[0],
+            issuer_gid=identity[1],
+            broker_uid=os.geteuid(),
+            broker_gid=os.getegid(),
+        )
+    return stores
+
+
+def _load_endpoint_identities(raw: str) -> dict[str, tuple[int, int]]:
+    if not raw:
+        return {}
+    resolved: dict[str, tuple[int, int]] = {}
+    for item in raw.split(","):
+        endpoint, separator, username = item.partition("=")
+        if (
+            not separator
+            or not endpoint
+            or not username
+            or not all(char.isalnum() or char in "_-" for char in endpoint)
+            or endpoint in resolved
+        ):
+            raise SystemExit(
+                "omp-delegate-broker: invalid HERMES_OMP_ENDPOINT_USERS mapping")
+        try:
+            account = pwd.getpwnam(username)
+        except KeyError:
+            raise SystemExit(
+                "omp-delegate-broker: endpoint user does not exist") from None
+        resolved[endpoint] = (account.pw_uid, account.pw_gid)
+    return resolved
+
+
+def _load_endpoint_uids(raw: str) -> dict[str, int]:
+    return {
+        endpoint: identity[0]
+        for endpoint, identity in _load_endpoint_identities(raw).items()
+    }
+
+
+ENDPOINT_IDENTITIES = _load_endpoint_identities(
+    os.environ.get("HERMES_OMP_ENDPOINT_USERS", ""))
+ENDPOINT_UIDS = {
+    endpoint: identity[0]
+    for endpoint, identity in ENDPOINT_IDENTITIES.items()
+}
+
+LEASE_STORES = _load_lease_stores()
 _ACTIVE_PROCESS_GROUP: int | None = None
 
 
@@ -98,6 +172,8 @@ def _load_policy() -> tuple[
 ALLOWED_WORKSPACES, ALLOWED_SANDBOXES, REPOSITORY_PATHS, CALLER_POLICIES = _load_policy()
 REQUEST_FIELDS = {"version", "request_id", "task_id", "repository", "caller", "workspace", "sandbox", "model", "prompt", "timeout"}
 STATUS_REQUEST_FIELDS = {"version", "op", "request_id", "caller", "repository"}
+V2_REQUEST_FIELDS = {"version", "op", "lease_id"}
+HEALTH_REQUEST_FIELDS = {"version", "op"}
 STATUS_JOB_FIELDS = (
     "request_id", "task_id", "repository", "caller", "status", "result",
     "created_at", "updated_at",
@@ -118,7 +194,10 @@ SYSTEM_APPEND = (
 
 
 class ProtocolError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, version: int = 1, operation: str = "execute") -> None:
+        super().__init__(message)
+        self.version = version
+        self.operation = operation
 
 
 def effective_model(caller: str) -> str:
@@ -157,6 +236,7 @@ class Request:
     create_only: bool
     fallback_models: tuple[str, ...] | None = None
     fallback_selectors: tuple[str, ...] = ()
+    protocol_version: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -164,7 +244,18 @@ class StatusRequest:
     request_id: str
     caller: str
     repository: str
+    protocol_version: int = 1
 
+
+@dataclasses.dataclass(frozen=True)
+class ListenerEndpoint:
+    endpoint: str
+    socket: socket.socket
+
+@dataclasses.dataclass(frozen=True)
+class HealthRequest:
+    endpoint: str
+    peer_uid: int
 
 def git_common_dir(path: Path) -> Path | None:
     """The shared .git of a checkout or worktree, or None if it is not git."""
@@ -239,7 +330,52 @@ def validate_status_request(value: object, *, peer_uid: int) -> StatusRequest:
     return StatusRequest(value["request_id"], value["caller"], value["repository"])
 
 
-def parse_request(value: object, *, peer_uid: int) -> Request | StatusRequest:
+def parse_request(
+    value: object, *, peer_uid: int, endpoint: str | None = None,
+) -> Request | StatusRequest | HealthRequest:
+    if isinstance(value, dict) and value.get("op") == "health":
+        unavailable = ProtocolError(
+            "endpoint unavailable", version=2, operation="health")
+        if (
+            set(value) != HEALTH_REQUEST_FIELDS
+            or value.get("version") != 2
+            or not endpoint
+            or endpoint not in LEASE_STORES
+            or ENDPOINT_UIDS.get(endpoint) != peer_uid
+        ):
+            raise unavailable
+        return HealthRequest(endpoint, peer_uid)
+    if isinstance(value, dict) and value.get("version") == 2:
+        operation = value.get("op")
+        unavailable = ProtocolError(
+            "job unavailable", version=2,
+            operation=operation if operation in {"execute", "status"} else "execute",
+        )
+        if (
+            set(value) != V2_REQUEST_FIELDS
+            or operation not in {"execute", "status"}
+            or not isinstance(value.get("lease_id"), str)
+            or not value["lease_id"]
+            or not endpoint
+            or endpoint not in LEASE_STORES
+        ):
+            raise unavailable
+        store = LEASE_STORES[endpoint]
+        try:
+            if operation == "execute":
+                fixed = store.consume(
+                    value["lease_id"], endpoint=endpoint, peer_uid=peer_uid)
+                request = validate_request(
+                    {"version": 1, **fixed}, peer_uid=None)
+                return dataclasses.replace(request, protocol_version=2)
+            fixed = store.resolve(
+                value["lease_id"], endpoint=endpoint, peer_uid=peer_uid)
+            return StatusRequest(
+                str(fixed["request_id"]), str(fixed["caller"]),
+                str(fixed["repository"]), 2,
+            )
+        except (LeaseUnavailable, ProtocolError, KeyError, OSError, TypeError, ValueError):
+            raise unavailable from None
     if isinstance(value, dict) and "op" in value:
         if value.get("op") != "status":
             raise ProtocolError("unsupported protocol operation")
@@ -247,8 +383,9 @@ def parse_request(value: object, *, peer_uid: int) -> Request | StatusRequest:
     return validate_request(value, peer_uid=peer_uid)
 
 
-def validate_request(value: object, *, peer_uid: int) -> Request:
-    _validate_peer_uid(peer_uid)
+def validate_request(value: object, *, peer_uid: int | None) -> Request:
+    if peer_uid is not None:
+        _validate_peer_uid(peer_uid)
     if not isinstance(value, dict) or set(value) != REQUEST_FIELDS:
         raise ProtocolError("request fields do not match protocol v1")
     if value.get("version") != 1:
@@ -644,9 +781,11 @@ def _watch_client_lifetime(
         stop.wait(0.05)
 
 
-def _error_response(message: str, *, request_id: str = "") -> dict[str, object]:
+def _error_response(
+    message: str, *, request_id: str = "", version: int = 1,
+) -> dict[str, object]:
     return {
-        "version": 1,
+        "version": version,
         "exit_code": 69,
         "stdout": "",
         "stderr": f"omp-delegate-broker: {message}\n",
@@ -657,13 +796,25 @@ def _error_response(message: str, *, request_id: str = "") -> dict[str, object]:
     }
 
 
-def _status_error_response() -> dict[str, object]:
+def _status_error_response(*, version: int = 1) -> dict[str, object]:
     return {
-        "version": 1,
+        "version": version,
         "op": "status",
         "ok": False,
         "error": "job unavailable",
     }
+
+def _health_error_response() -> dict[str, object]:
+    return {
+        "version": 2,
+        "op": "health",
+        "ok": False,
+        "error": "endpoint unavailable",
+    }
+
+
+def read_health(_request: HealthRequest) -> dict[str, object]:
+    return {"version": 2, "op": "health", "ok": True}
 
 
 def read_status(request: StatusRequest) -> dict[str, object]:
@@ -674,19 +825,19 @@ def read_status(request: StatusRequest) -> dict[str, object]:
         or request.repository not in repositories
         or request.repository not in REPOSITORY_PATHS
     ):
-        return _status_error_response()
+        return _status_error_response(version=request.protocol_version)
     try:
         record = JOB_STORE.get(request.request_id)
         if (
             record.get("caller") != request.caller
             or record.get("repository") != request.repository
         ):
-            return _status_error_response()
+            return _status_error_response(version=request.protocol_version)
         job = {name: record[name] for name in STATUS_JOB_FIELDS}
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
-        return _status_error_response()
+        return _status_error_response(version=request.protocol_version)
     return {
-        "version": 1,
+        "version": request.protocol_version,
         "op": "status",
         "ok": True,
         "job": job,
@@ -708,8 +859,10 @@ def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
             request_id=request_id, caller=request.caller, workspace=request.workspace,
             outcome="lock_busy", usage={},
         )
-        JOB_STORE.finish(request_id, "rejected", _error_response(str(exc), request_id=request_id))
-        return _error_response(str(exc), request_id=request_id)
+        response = _error_response(
+            str(exc), request_id=request_id, version=request.protocol_version)
+        JOB_STORE.finish(request_id, "rejected", response)
+        return response
 
     try:
         provider_api_keys = resolve_provider_api_keys(request)
@@ -718,7 +871,8 @@ def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
             request_id=request_id, caller=request.caller, workspace=request.workspace,
             outcome="credential_error", usage={},
         )
-        response = _error_response(str(exc), request_id=request_id)
+        response = _error_response(
+            str(exc), request_id=request_id, version=request.protocol_version)
         JOB_STORE.finish(request_id, "failed", response)
         lock.close()
         return response
@@ -734,12 +888,12 @@ def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
                     request_id=request_id, caller=request.caller, workspace=request.workspace,
                     outcome="start_error", usage={},
                 )
-                JOB_STORE.finish(
-                    request_id,
-                    "failed",
-                    _error_response(f"OMP could not start: {exc}", request_id=request_id),
+                response = _error_response(
+                    f"OMP could not start: {exc}", request_id=request_id,
+                    version=request.protocol_version,
                 )
-                return _error_response(f"OMP could not start: {exc}", request_id=request_id)
+                JOB_STORE.finish(request_id, "failed", response)
+                return response
 
             JOB_STORE.running(request_id, process_group=process.pid)
             _ACTIVE_PROCESS_GROUP = process.pid
@@ -783,7 +937,7 @@ def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
                 outcome=outcome, usage={},
             )
             response = {
-                "version": 1,
+                "version": request.protocol_version,
                 "exit_code": exit_code,
                 "stdout": stdout,
                 "stderr": stderr,
@@ -830,54 +984,152 @@ def _send_frame(conn: socket.socket, value: dict[str, object]) -> None:
     conn.settimeout(FRAME_TIMEOUT)
     payload = json.dumps(value, separators=(",", ":")).encode()
     if len(payload) > MAX_RESPONSE_BYTES:
+        version = value.get("version")
+        response_version = version if version in {1, 2} else 1
         fallback = (
-            _status_error_response()
+            _health_error_response()
+            if value.get("op") == "health"
+            else _status_error_response(version=response_version)
             if value.get("op") == "status"
-            else _error_response("response exceeded size bound")
+            else _error_response(
+                "response exceeded size bound", version=response_version)
         )
         payload = json.dumps(fallback, separators=(",", ":")).encode()
     conn.sendall(struct.pack("!I", len(payload)) + payload)
 
 
-def receive_request(conn: socket.socket) -> Request | StatusRequest:
+def receive_request(
+    conn: socket.socket, *, endpoint: str | None = None, allow_v1: bool = True,
+) -> Request | StatusRequest | HealthRequest:
     deadline = time.monotonic() + FRAME_TIMEOUT
     size = struct.unpack("!I", _recv_exact(conn, 4, deadline))[0]
     if size <= 0 or size > MAX_REQUEST_BYTES:
         raise ProtocolError("request frame is outside size bound")
     value = json.loads(_recv_exact(conn, size, deadline))
-    request = parse_request(value, peer_uid=_peer_uid(conn))
+    if not allow_v1 and (
+        not isinstance(value, dict) or value.get("version") != 2
+    ):
+        if isinstance(value, dict) and value.get("op") == "health":
+            raise ProtocolError(
+                "endpoint unavailable", version=2, operation="health")
+        operation = (
+            "status"
+            if isinstance(value, dict) and value.get("op") == "status"
+            else "execute"
+        )
+        raise ProtocolError(
+            "job unavailable", version=2, operation=operation)
+    request = parse_request(value, peer_uid=_peer_uid(conn), endpoint=endpoint)
+    if (
+        not allow_v1
+        and not isinstance(request, HealthRequest)
+        and request.protocol_version != 2
+    ):
+        raise ProtocolError("job unavailable", version=2)
     conn.settimeout(None)
     return request
 
 
+def _serve_connection(
+    conn: socket.socket, *, endpoint: str | None, allow_v1: bool,
+    recovered_orphans: list[bool],
+) -> None:
+    request_id = ""
+    invocation = False
+    try:
+        request = receive_request(
+            conn, endpoint=endpoint, allow_v1=allow_v1)
+        if isinstance(request, HealthRequest):
+            response = read_health(request)
+        else:
+            request_id = request.request_id
+            if isinstance(request, StatusRequest):
+                response = read_status(request)
+            else:
+                invocation = True
+                if not recovered_orphans[0]:
+                    JOB_STORE.recover_orphans()
+                    recovered_orphans[0] = True
+                response = run_request(request, conn)
+    except (OSError, ProtocolError, json.JSONDecodeError, struct.error, ValueError) as exc:
+        if not allow_v1:
+            version = 2
+            operation = exc.operation if isinstance(exc, ProtocolError) else "execute"
+            message = (
+                "endpoint unavailable" if operation == "health"
+                else "job unavailable"
+            )
+        else:
+            version = exc.version if isinstance(exc, ProtocolError) else 1
+            operation = exc.operation if isinstance(exc, ProtocolError) else "execute"
+            message = str(exc)
+        response = (
+            _health_error_response()
+            if version == 2 and operation == "health"
+            else _status_error_response(version=version)
+            if version == 2 and operation == "status"
+            else _error_response(message, request_id=request_id, version=version)
+        )
+    try:
+        _send_frame(conn, response)
+    except OSError:
+        if invocation and request_id:
+            try:
+                JOB_STORE.delivery_failed(request_id)
+            except (OSError, ValueError):
+                pass
+
+
 def serve(listener: socket.socket) -> None:
-    recovered_orphans = False
+    """Protocol-v1 compatibility entry point; never selected by main()."""
+    recovered_orphans = [False]
     while True:
         conn, _ = listener.accept()
         with conn:
-            request_id = ""
-            invocation = False
-            try:
-                request = receive_request(conn)
-                request_id = request.request_id
-                if isinstance(request, StatusRequest):
-                    response = read_status(request)
-                else:
-                    invocation = True
-                    if not recovered_orphans:
-                        JOB_STORE.recover_orphans()
-                        recovered_orphans = True
-                    response = run_request(request, conn)
-            except (OSError, ProtocolError, json.JSONDecodeError, struct.error, ValueError) as exc:
-                response = _error_response(str(exc), request_id=request_id)
-            try:
-                _send_frame(conn, response)
-            except OSError:
-                if invocation and request_id:
-                    try:
-                        JOB_STORE.delivery_failed(request_id)
-                    except (OSError, ValueError):
-                        pass
+            _serve_connection(
+                conn, endpoint=None, allow_v1=True,
+                recovered_orphans=recovered_orphans)
+
+
+def systemd_listeners() -> list[ListenerEndpoint]:
+    if int(os.environ.get("LISTEN_PID", "0")) != os.getpid():
+        raise SystemExit("omp-delegate-broker: systemd listener pid does not match")
+    count = int(os.environ.get("LISTEN_FDS", "0"))
+    names = os.environ.get("LISTEN_FDNAMES", "").split(":")
+    if (
+        count <= 0
+        or len(names) != count
+        or any(not name for name in names)
+        or len(set(names)) != count
+    ):
+        raise SystemExit(
+            "omp-delegate-broker: every systemd listener requires a unique FileDescriptorName")
+    if any(name not in LEASE_STORES for name in names):
+        raise SystemExit(
+            "omp-delegate-broker: every named listener requires a private lease store")
+    if any(name not in ENDPOINT_UIDS for name in names):
+        raise SystemExit(
+            "omp-delegate-broker: every named listener requires an endpoint user")
+    return [
+        ListenerEndpoint(name, socket.socket(fileno=3 + offset))
+        for offset, name in enumerate(names)
+    ]
+
+
+def serve_named(listeners: list[ListenerEndpoint]) -> None:
+    """Serially serve every named authority endpoint in one global-lock process."""
+    by_fd = {item.socket.fileno(): item for item in listeners}
+    recovered_orphans = [False]
+    while True:
+        readable, _, _ = select.select(
+            [item.socket for item in listeners], [], [])
+        for listener in readable:
+            endpoint = by_fd[listener.fileno()]
+            conn, _ = listener.accept()
+            with conn:
+                _serve_connection(
+                    conn, endpoint=endpoint.endpoint, allow_v1=False,
+                    recovered_orphans=recovered_orphans)
 
 
 def _terminate(signum: int, _frame: object) -> None:
@@ -889,10 +1141,7 @@ def _terminate(signum: int, _frame: object) -> None:
 def main() -> int:
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, _terminate)
-    if int(os.environ.get("LISTEN_PID", "0")) != os.getpid() or int(os.environ.get("LISTEN_FDS", "0")) != 1:
-        raise SystemExit("omp-delegate-broker: exactly one systemd socket is required")
-    listener = socket.socket(fileno=3)
-    serve(listener)
+    serve_named(systemd_listeners())
     return 0
 
 

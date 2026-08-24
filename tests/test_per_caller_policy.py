@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import pwd
 import sys
 import tempfile
 import unittest
@@ -27,10 +28,31 @@ CLIENT = ROOT / "client" / "omp-invoke.py"
 def load_broker(policy: dict, td: str):
     policy_path = Path(td) / "policy.json"
     policy_path.write_text(json.dumps(policy))
+    for endpoint in ("audit", "planner"):
+        store_root = Path(td) / "leases" / endpoint
+        (store_root / "issued").mkdir(
+            parents=True, exist_ok=True, mode=0o750)
+        (store_root / "consumed").mkdir(
+            parents=True, exist_ok=True, mode=0o700)
+        lock_fd = os.open(
+            store_root / ".lease-store.lock",
+            os.O_RDWR | os.O_CREAT,
+            0o660,
+        )
+        os.fchmod(lock_fd, 0o660)
+        os.close(lock_fd)
     with mock.patch.dict(os.environ, {
         "HERMES_OMP_POLICY": str(policy_path),
         "HERMES_OMP_CALLER_UID": str(os.getuid()),
         "HERMES_OMP_JOB_DIR": str(Path(td) / "jobs"),
+        "HERMES_OMP_LEASE_DIRS": (
+            f"audit={Path(td) / 'leases' / 'audit'},"
+            f"planner={Path(td) / 'leases' / 'planner'}"
+        ),
+        "HERMES_OMP_ENDPOINT_USERS": (
+            f"audit={pwd.getpwuid(os.getuid()).pw_name},"
+            f"planner={pwd.getpwuid(os.getuid()).pw_name}"
+        ),
         "HERMES_OMP_MODEL": "provider/model",
     }):
         spec = importlib.util.spec_from_file_location("broker_pcm", BROKER)
@@ -210,6 +232,69 @@ class ClientPerCallerModel(unittest.TestCase):
             with self.assertRaises(module.InvocationError):
                 module.resolve_policy(env, Path(td))
 
+
+
+class NamedListenerProtocolV2(unittest.TestCase):
+    def test_multiple_systemd_listener_names_are_preserved_as_endpoint_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            module = load_broker(_policy(td), td)
+            fake_sockets = [object(), object()]
+            with mock.patch.dict(os.environ, {
+                "LISTEN_PID": str(os.getpid()),
+                "LISTEN_FDS": "2",
+                "LISTEN_FDNAMES": "audit:planner",
+            }), mock.patch.object(module.socket, "socket", side_effect=fake_sockets) as make:
+                listeners = module.systemd_listeners()
+            self.assertEqual(["audit", "planner"], [item.endpoint for item in listeners])
+            self.assertEqual(fake_sockets, [item.socket for item in listeners])
+            self.assertEqual([mock.call(fileno=3), mock.call(fileno=4)], make.call_args_list)
+
+    def test_listener_without_one_nonempty_unique_name_per_fd_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            module = load_broker(_policy(td), td)
+            for names in ("", "audit", "audit:audit", "audit:"):
+                with self.subTest(names=names), mock.patch.dict(os.environ, {
+                    "LISTEN_PID": str(os.getpid()),
+                    "LISTEN_FDS": "2",
+                    "LISTEN_FDNAMES": names,
+                }):
+                    with self.assertRaises(SystemExit):
+                        module.systemd_listeners()
+
+    def test_named_listener_without_private_lease_store_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            module = load_broker(_policy(td), td)
+            with mock.patch.dict(os.environ, {
+                "LISTEN_PID": str(os.getpid()),
+                "LISTEN_FDS": "2",
+                "LISTEN_FDNAMES": "audit:code",
+            }):
+                with self.assertRaises(SystemExit):
+                    module.systemd_listeners()
+
+    def test_endpoint_users_resolve_to_exact_uids_and_cover_every_listener(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            module = load_broker(_policy(td), td)
+            entries = {
+                "audit-user": mock.Mock(pw_uid=997),
+                "planner-user": mock.Mock(pw_uid=998),
+            }
+            with mock.patch.object(
+                module.pwd, "getpwnam", side_effect=entries.__getitem__,
+            ):
+                self.assertEqual(
+                    {"audit": 997, "planner": 998},
+                    module._load_endpoint_uids(
+                        "audit=audit-user,planner=planner-user"),
+                )
+            module.ENDPOINT_UIDS.pop("planner")
+            with mock.patch.dict(os.environ, {
+                "LISTEN_PID": str(os.getpid()),
+                "LISTEN_FDS": "2",
+                "LISTEN_FDNAMES": "audit:planner",
+            }):
+                with self.assertRaises(SystemExit):
+                    module.systemd_listeners()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

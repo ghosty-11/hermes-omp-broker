@@ -1,11 +1,14 @@
-"""Two-stage maturation tool and fallback contracts (v3).
+"""Two-stage maturation tool and fallback contracts (v4).
 
-`backlog-maturation-research` is the Opus staging orchestrator: caller identity
-must reach the trusted extension, which then admits only `task`,
-`backlog_search`, `backlog_fetch`, plus read/write inside the staging workspace.
-`backlog-maturation` is the Opus Wiki writer and must not receive those
-network/spawn surfaces. Task input is structural: the three named agents, at
-most five children (four Sonnet + one Fable), no caller-supplied model, no
+`backlog-maturation-research` is the Opus staged-only orchestrator: caller
+identity must reach the trusted extension, which then admits only `task`,
+read/grep/glob-style staging IO, `todo`, `yield`, and `broker_finalize`.
+Outbound research moved to the deterministic egress launcher, so the caller
+has no `backlog_search`, no `backlog_fetch`, and no generic outbound web
+tool; the extension must not even register those tools for it.
+`backlog-maturation` is the Opus Wiki writer and must not receive task/spawn
+surfaces. Task input is structural: the three named agents, at most five
+children (four Sonnet + one Fable), no caller-supplied model, no
 async/background, no nested spawn. Fallback rungs and minted credentials are
 per-caller policy, not one global chain. The wire schema must admit the 3600 s
 policy ceiling.
@@ -205,26 +208,35 @@ console.log(JSON.stringify(output));''')
             isinstance(result, dict) and result.get("block") for result in results
         ))
 
-    def test_research_allows_custom_surfaces_and_staging_io(self) -> None:
+    def test_research_is_staged_only_with_no_outbound_tool_surface(self) -> None:
         results = self.exercise([
             {"toolName": "task", "input": _valid_batch()},
-            {"toolName": "backlog_search", "input": {"query": "gap"}},
-            {"toolName": "backlog_fetch", "input": {"url": "https://example.com"}},
             {"toolName": "read", "input": {"path": "runs/manifest.json"}},
             {"toolName": "write", "input": {"path": "runs/manifest.json", "content": "{}"}},
+            {"toolName": "grep", "input": {"pattern": "claim", "path": "runs"}},
+            {"toolName": "glob", "input": {"path": "runs/**"}},
             {"toolName": "yield", "input": {"summary": "worker result"}},
-            {"toolName": "hub", "input": {"op": "list"}},
+            {"toolName": "backlog_search", "input": {"query": "gap"}},
+            {"toolName": "backlog_fetch", "input": {"url": "https://example.com"}},
             {"toolName": "web_search", "input": {"query": "unbounded"}},
+            {"toolName": "web_fetch", "input": {"url": "https://example.com"}},
+            {"toolName": "fetch", "input": {"url": "https://example.com"}},
+            {"toolName": "browser", "input": {"url": "https://example.com"}},
+            {"toolName": "curl", "input": {"url": "https://example.com"}},
+            {"toolName": "hub", "input": {"op": "list"}},
         ], caller=RESEARCH, sandbox="restricted-write",
             write_patterns=["runs/**"])
-        self.assertIsNone(results[0])
-        self.assertIsNone(results[1])
-        self.assertIsNone(results[2])
-        self.assertIsNone(results[3])
-        self.assertIsNone(results[4])
-        self.assertIsNone(results[5])
-        self.assertTrue(results[6]["block"])
-        self.assertTrue(results[7]["block"])
+        for index in range(6):
+            self.assertIsNone(results[index], results[index])
+        for index in range(6, len(results)):
+            self.assertTrue(
+                isinstance(results[index], dict) and results[index]["block"],
+                results[index],
+            )
+            self.assertEqual(
+                "Tool is outside the OMP delegation workspace policy",
+                results[index]["reason"],
+            )
 
     def test_research_caller_cannot_shadow_agents_even_if_sandbox_drifts(self) -> None:
         [result] = self.exercise([
@@ -389,8 +401,10 @@ class ResearchPolicyBrokerTest(unittest.TestCase):
             self.assertEqual(argv[argv.index("--config") + 1], str(path))
 
 
-class ResearchFetchSecurityTest(unittest.TestCase):
-    def test_private_targets_are_rejected_before_firecrawl(self) -> None:
+class ResearchOutboundSurfaceRemovedTest(unittest.TestCase):
+    """The extension must register no outbound tool for the research caller."""
+
+    def test_no_outbound_tool_is_registered_and_nothing_reaches_fetch(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             runner = root / "runner.ts"
@@ -401,8 +415,7 @@ const scalar = {{ optional() {{ return this; }}, describe() {{ return this; }} }
 let calls = 0;
 globalThis.fetch = async () => {{
   calls += 1;
-  return new Response(JSON.stringify({{success:true,data:{{markdown:"private"}}}}),
-                      {{status:200,headers:{{"content-type":"application/json"}}}});
+  return new Response("{{}}", {{status:200}});
 }};
 const pi = {{
   zod: {{string:()=>scalar,number:()=>scalar,array:()=>scalar,enum:()=>scalar,object:()=>scalar}},
@@ -410,84 +423,33 @@ const pi = {{
   registerTool: (t:any) => tools.set(t.name,t),
 }};
 extension(pi);
-const tool = tools.get("backlog_fetch");
-const a = await tool.execute("a", {{url:"http://127.0.0.1:8000/private"}});
-const b = await tool.execute("b", {{url:"http://10.0.0.1/private"}});
-console.log(JSON.stringify({{calls,results:[a,b]}}));''', encoding="utf-8")
+const decisions = [];
+const ctx = {{cwd:{json.dumps(str(root))}}};
+for (const name of ["backlog_search","backlog_fetch","web_search","web_fetch","fetch","browser"]) {{
+  decisions.push(await handlers.get("tool_call")!({{toolName:name,input:{{query:"q",url:"https://example.com"}}}}, ctx));
+}}
+console.log(JSON.stringify({{
+  calls,
+  registered: Array.from(tools.keys()).sort(),
+  decisions,
+}}));''', encoding="utf-8")
             env = {**os.environ, "OMP_DELEGATE_CALLER": RESEARCH,
                    "OMP_DELEGATE_SANDBOX": "restricted-write",
                    "OMP_DELEGATE_READ_PATHS": "[]",
                    "OMP_DELEGATE_WRITE_PATTERNS": '["runs/**"]',
-                   "OMP_DELEGATE_GIT_MODE": "none"}
+                   "OMP_DELEGATE_GIT_MODE": "none",
+                   "OMP_DELEGATE_FINAL_PATH": str(root / "final.json"),
+                   "OMP_DELEGATE_CREATE_ONLY": "0"}
             result = subprocess.run(
                 ["node", str(runner)], env=env, text=True,
                 capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         value = json.loads(result.stdout)
-        self.assertEqual(value["calls"], 0)
-        self.assertTrue(all(row["isError"] for row in value["results"]))
-        self.assertTrue(all("invalid url" in row["content"][0]["text"]
-                            for row in value["results"]))
-
-
-
-class ResearchFetchPublicAddressTest(unittest.TestCase):
-    """backlog_fetch must admit public IPv4 and reject mapped private IPv6."""
-
-    def _run(self, urls: list[str]) -> dict:
-        with tempfile.TemporaryDirectory() as td:
-            runner = Path(td) / "runner.ts"
-            listed = json.dumps(urls)
-            runner.write_text(f'''import extension from {json.dumps(EXTENSION.as_uri())};
-const tools = new Map<string, any>();
-const scalar = {{ optional() {{ return this; }}, describe() {{ return this; }} }};
-const fetched: string[] = [];
-globalThis.fetch = async (_url: string, init?: {{body?: string}}) => {{
-  const body = typeof init?.body === "string" ? JSON.parse(init.body) : {{}};
-  fetched.push(String(body.url || ""));
-  return new Response(JSON.stringify({{success:true,data:{{markdown:"ok"}}}}),
-                      {{status:200,headers:{{"content-type":"application/json"}}}});
-}};
-const pi = {{
-  zod: {{string:()=>scalar,number:()=>scalar,array:()=>scalar,enum:()=>scalar,object:()=>scalar}},
-  on: () => {{}},
-  registerTool: (t:any) => tools.set(t.name,t),
-}};
-extension(pi);
-const tool = tools.get("backlog_fetch");
-const results = [];
-for (const url of {listed}) {{
-  results.push(await tool.execute("id", {{url}}));
-}}
-console.log(JSON.stringify({{fetched, results}}));''', encoding="utf-8")
-            env = {**os.environ, "OMP_DELEGATE_CALLER": RESEARCH,
-                   "OMP_DELEGATE_SANDBOX": "restricted-write",
-                   "OMP_DELEGATE_READ_PATHS": "[]",
-                   "OMP_DELEGATE_WRITE_PATTERNS": '["runs/**"]',
-                   "OMP_DELEGATE_GIT_MODE": "none"}
-            result = subprocess.run(
-                ["node", str(runner)], env=env, text=True,
-                capture_output=True, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return json.loads(result.stdout)
-
-    def test_public_ipv4_is_fetched_and_mapped_private_is_not(self) -> None:
-        value = self._run([
-            "http://8.8.8.8/public",
-            "http://127.0.0.1/private",
-            "http://10.0.0.1/private",
-            "http://[::ffff:127.0.0.1]/mapped-private",
-            "http://[::ffff:8.8.8.8]/mapped-public",
-        ])
-        fetched = value["fetched"]
-        self.assertIn("http://8.8.8.8/public", fetched)
-        self.assertTrue(any("mapped-public" in url for url in fetched))
-        self.assertNotIn("http://127.0.0.1/private", fetched)
-        self.assertNotIn("http://10.0.0.1/private", fetched)
-        self.assertFalse(any("mapped-private" in url for url in fetched))
-        texts = " ".join(row["content"][0]["text"] for row in value["results"]
-                         if row.get("isError"))
-        self.assertIn("invalid url", texts)
+        self.assertEqual(0, value["calls"])
+        self.assertEqual(["broker_finalize"], value["registered"])
+        for decision in value["decisions"]:
+            self.assertTrue(
+                isinstance(decision, dict) and decision.get("block"), decision)
 
 
 class ResearchPolicySchemaTest(unittest.TestCase):
