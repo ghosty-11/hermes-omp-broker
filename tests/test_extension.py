@@ -129,6 +129,32 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
         self.assertTrue(results[2]["block"])
         self.assertTrue(results[3]["block"])
 
+    def test_scoped_git_reads_any_branch_range(self) -> None:
+        """diff/log must accept real branch names, not only HEAD and main.
+
+        The PR review lane reviews a diff between a base ref and a card
+        branch like backlog/t_027be053; the first grammar admitted only
+        HEAD/main, so the reviewer ran with no diff at all and returned
+        PARTIALLY MET twice before anyone looked here.
+        """
+        results = self.exercise([
+            {"toolName": "bash", "input": {
+                "command": "git diff master...backlog/t_027be053"}},
+            {"toolName": "bash", "input": {
+                "command": "git diff --stat 079c5a0..b4be7e8"}},
+            {"toolName": "bash", "input": {
+                "command": "git log -n 5 backlog/t_027be053"}},
+            {"toolName": "bash", "input": {
+                "command": "git diff ../outside"}},
+            {"toolName": "bash", "input": {
+                "command": "git push origin backlog/t_027be053"}},
+        ], sandbox="restricted-write", write_patterns=[], git_mode="scoped")
+        self.assertIsNone(results[0])
+        self.assertIsNone(results[1])
+        self.assertIsNone(results[2])
+        self.assertTrue(results[3]["block"])
+        self.assertTrue(results[4]["block"])
+
     def test_globstar_write_pattern_admits_nested_paths(self) -> None:
         """`backlog/**` must admit the whole subtree, not one path segment.
 

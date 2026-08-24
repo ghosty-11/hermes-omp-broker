@@ -478,6 +478,14 @@ function tokenizeGitCommand(command: string): string[] | null {
   return tokens;
 }
 
+function isReadableRef(arg: string): boolean {
+  // A ref-shaped token for the read verbs (diff/log): branch names, tags,
+  // remote refs like origin/master, commit SHAs, and HEAD~1-style suffixes.
+  // No leading dot or slash and no traversal component — pathspec-looking
+  // arguments fall through to the write-pattern check instead.
+  return /^[A-Za-z0-9_][A-Za-z0-9_./~-]*$/.test(arg) && !arg.includes("/../");
+}
+
 function scopedGitCommandAllowed(input: unknown, workspace: string): boolean {
   if (process.env.OMP_DELEGATE_GIT_MODE !== "scoped"
     || !input || typeof input !== "object" || !("command" in input)
@@ -508,7 +516,7 @@ function scopedGitCommandAllowed(input: unknown, workspace: string): boolean {
       || /^-n\d+$/.test(arg)
       || (arg === "-n" && /^\d+$/.test(args[index + 1] ?? ""))
       || (index > 0 && args[index - 1] === "-n" && /^\d+$/.test(arg))
-      || /^(?:HEAD|main)(?:\.{2,3}(?:HEAD|main))?$/.test(arg)
+      || isReadableRef(arg)
     );
   }
   if (subcommand === "diff") {
@@ -526,7 +534,7 @@ function scopedGitCommandAllowed(input: unknown, workspace: string): boolean {
       "--": true,
     };
     return args.every((arg) => Object.hasOwn(allowed, arg)
-      || /^(?:HEAD|main)(?:\.{2,3}(?:HEAD|main))?$/.test(arg)
+      || isReadableRef(arg)
       || restrictedWriteAllowed(arg, workspace));
   }
   if (subcommand === "add") {
