@@ -15,9 +15,11 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Mapping
@@ -374,7 +376,12 @@ def parse_request(
                 str(fixed["request_id"]), str(fixed["caller"]),
                 str(fixed["repository"]), 2,
             )
-        except (LeaseUnavailable, ProtocolError, KeyError, OSError, TypeError, ValueError):
+        except (LeaseUnavailable, ProtocolError, KeyError, OSError, TypeError, ValueError) as exc:
+            # The wire deliberately stays generic for lease-bound callers,
+            # but the journal must carry the true reason (2026-08-26: this
+            # collapse hid a consumed-lease rejection for hours).
+            print(f"omp-delegate-broker: v2 {operation} rejected: {exc!r}",
+                  file=sys.stderr)
             raise unavailable from None
     if isinstance(value, dict) and "op" in value:
         if value.get("op") != "status":
@@ -758,6 +765,16 @@ def record_audit(
         os.close(fd)
 
 
+def _audit_safely(**kwargs) -> None:
+    """Audit rows are evidence, never prerequisites: a failed write must not
+    orphan a job or kill the serial serve loop (2026-08-26 zombie class)."""
+    try:
+        record_audit(**kwargs)
+    except OSError as exc:
+        print(f"omp-delegate-broker: audit write failed: {exc}",
+              file=sys.stderr)
+
+
 def _watch_client_lifetime(
     conn: socket.socket,
     process_group: int,
@@ -845,6 +862,10 @@ def read_status(request: StatusRequest) -> dict[str, object]:
 
 
 def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
+    """Exception-safe shell: the job record and the serial serve loop must
+    both survive ANY fault. On 2026-08-26 a sandboxed TemporaryDirectory
+    EROFS escaped the inner handlers and froze two production jobs at
+    pending with no audit row while the client saw only a masked error."""
     request_id = request.request_id
     JOB_STORE.create(
         request_id,
@@ -853,9 +874,35 @@ def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
         caller=request.caller,
     )
     try:
+        return _run_request_inner(request, conn)
+    except Exception as exc:  # noqa: BLE001 — deliberate last-resort boundary
+        traceback.print_exc(file=sys.stderr)
+        _audit_safely(
+            request_id=request_id, caller=request.caller,
+            workspace=request.workspace, outcome="failure", usage={},
+        )
+        response = _error_response(
+            f"broker execution fault: {type(exc).__name__}: {exc}",
+            request_id=request_id, version=request.protocol_version,
+        )
+        try:
+            # Never demote an already-terminal job (a fault after a
+            # successful finish must not overwrite completed with failed).
+            if JOB_STORE.get(request_id).get("status") in (
+                    "pending", "running"):
+                JOB_STORE.finish(request_id, "failed", response)
+        except (OSError, ValueError) as finish_exc:
+            print("omp-delegate-broker: job finalization failed: "
+                  f"{finish_exc}", file=sys.stderr)
+        return response
+
+
+def _run_request_inner(request: Request, conn: socket.socket) -> dict[str, object]:
+    request_id = request.request_id
+    try:
         lock = acquire_workspace_lock(request.workspace)
     except ProtocolError as exc:
-        record_audit(
+        _audit_safely(
             request_id=request_id, caller=request.caller, workspace=request.workspace,
             outcome="lock_busy", usage={},
         )
@@ -867,7 +914,7 @@ def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
     try:
         provider_api_keys = resolve_provider_api_keys(request)
     except ProtocolError as exc:
-        record_audit(
+        _audit_safely(
             request_id=request_id, caller=request.caller, workspace=request.workspace,
             outcome="credential_error", usage={},
         )
@@ -884,7 +931,7 @@ def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
             try:
                 process = start_omp_process(request, final_path, provider_api_keys)
             except OSError as exc:
-                record_audit(
+                _audit_safely(
                     request_id=request_id, caller=request.caller, workspace=request.workspace,
                     outcome="start_error", usage={},
                 )
@@ -932,7 +979,7 @@ def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
             outcome = audit_outcome(
                 exit_code, timed_out, group_clear, final, disconnected.is_set(),
             )
-            record_audit(
+            _audit_safely(
                 request_id=request_id, caller=request.caller, workspace=request.workspace,
                 outcome=outcome, usage={},
             )
@@ -1032,7 +1079,6 @@ def receive_request(
 
 def _serve_connection(
     conn: socket.socket, *, endpoint: str | None, allow_v1: bool,
-    recovered_orphans: list[bool],
 ) -> None:
     request_id = ""
     invocation = False
@@ -1047,11 +1093,13 @@ def _serve_connection(
                 response = read_status(request)
             else:
                 invocation = True
-                if not recovered_orphans[0]:
-                    JOB_STORE.recover_orphans()
-                    recovered_orphans[0] = True
                 response = run_request(request, conn)
     except (OSError, ProtocolError, json.JSONDecodeError, struct.error, ValueError) as exc:
+        # The wire response stays generic for lease-bound callers, but the
+        # journal must carry the true reason: on 2026-08-26 this masking
+        # reduced three distinct root causes to "job unavailable" and cost
+        # hours of blind diagnosis.
+        print(f"omp-delegate-broker: request failed: {exc!r}", file=sys.stderr)
         if not allow_v1:
             version = 2
             operation = exc.operation if isinstance(exc, ProtocolError) else "execute"
@@ -1082,13 +1130,11 @@ def _serve_connection(
 
 def serve(listener: socket.socket) -> None:
     """Protocol-v1 compatibility entry point; never selected by main()."""
-    recovered_orphans = [False]
+    JOB_STORE.recover_orphans()
     while True:
         conn, _ = listener.accept()
         with conn:
-            _serve_connection(
-                conn, endpoint=None, allow_v1=True,
-                recovered_orphans=recovered_orphans)
+            _serve_connection(conn, endpoint=None, allow_v1=True)
 
 
 def systemd_listeners() -> list[ListenerEndpoint]:
@@ -1119,7 +1165,10 @@ def systemd_listeners() -> list[ListenerEndpoint]:
 def serve_named(listeners: list[ListenerEndpoint]) -> None:
     """Serially serve every named authority endpoint in one global-lock process."""
     by_fd = {item.socket.fileno(): item for item in listeners}
-    recovered_orphans = [False]
+    # Recover at startup, unconditionally. Gating this on the first EXECUTE
+    # deadlocked a stuck job on 2026-08-26: a status-only lane can never
+    # trigger an execute, so its zombie could never be recovered.
+    JOB_STORE.recover_orphans()
     while True:
         readable, _, _ = select.select(
             [item.socket for item in listeners], [], [])
@@ -1128,8 +1177,7 @@ def serve_named(listeners: list[ListenerEndpoint]) -> None:
             conn, _ = listener.accept()
             with conn:
                 _serve_connection(
-                    conn, endpoint=endpoint.endpoint, allow_v1=False,
-                    recovered_orphans=recovered_orphans)
+                    conn, endpoint=endpoint.endpoint, allow_v1=False)
 
 
 def _terminate(signum: int, _frame: object) -> None:
