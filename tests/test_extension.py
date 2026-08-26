@@ -129,6 +129,35 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
         self.assertTrue(results[2]["block"])
         self.assertTrue(results[3]["block"])
 
+    def test_scoped_git_commit_admits_attribution_trailers(self) -> None:
+        """The maturation writer contract requires exact Backlog-Run and
+        Backlog-Request trailer lines, but a single -m arg cannot carry a
+        newline through the one-command grammar and three -m args were
+        denied: g7 (2026-08-26) produced three untrailered commits and an
+        honest PARTIALLY MET. --trailer emits canonical trailer lines from
+        single-line arguments, so the grammar must admit it."""
+        results = self.exercise([
+            {"toolName": "bash", "input": {"command":
+                "git commit -m 'fold note' --trailer 'Backlog-Run: a625ff37' "
+                "--trailer 'Backlog-Request: req-03f25070'"}},
+            {"toolName": "bash", "input": {"command":
+                'git commit -m "note" --trailer "Backlog-Run: r1"'}},
+            {"toolName": "bash", "input": {"command":
+                "git commit -m 'a' -m 'b' -m 'c'"}},
+            {"toolName": "bash", "input": {"command":
+                "git commit -m 'a' --trailer notquoted"}},
+            {"toolName": "bash", "input": {"command":
+                "git commit --trailer 'Backlog-Run: r1'"}},
+            {"toolName": "bash", "input": {"command":
+                "git commit -m 'a' --amend"}},
+        ], sandbox="restricted-write", write_patterns=["docs/*"], git_mode="scoped")
+        self.assertIsNone(results[0], "subject plus both trailers is the contract form")
+        self.assertIsNone(results[1], "double quoting works the same")
+        self.assertTrue(results[2]["block"], "three -m args stay denied")
+        self.assertTrue(results[3]["block"], "unquoted trailer values stay denied")
+        self.assertTrue(results[4]["block"], "a commit still needs a -m message")
+        self.assertTrue(results[5]["block"], "--amend stays denied")
+
     def test_scoped_git_reads_any_branch_range(self) -> None:
         """diff/log must accept real branch names, not only HEAD and main.
 

@@ -376,8 +376,12 @@ function scopedGitCommandAllowed(input: unknown, workspace: string): boolean {
     const paths = args.filter((arg) => arg !== "--");
     return paths.length === 2 && paths.every((path) => restrictedWriteAllowed(path, workspace));
   }
+  // The maturation writer must land exact Backlog-Run/Backlog-Request
+  // trailer lines, but the one-command grammar cannot carry a newline and
+  // three -m args stay denied; --trailer emits canonical trailer lines from
+  // single-line "Key: value" arguments (g7, 2026-08-26).
   return subcommand === "commit"
-    && /^git commit(?: -m (?:'[^']+'|"[^"]+")){1,2}$/.test(command);
+    && /^git commit(?: -m (?:'[^']+'|"[^"]+")){1,2}(?: --trailer (?:'[^'\n]+: [^'\n]+'|"[^"\n]+: [^"\n]+")){0,2}$/.test(command);
 }
 
 
@@ -641,7 +645,7 @@ export default function ompDelegateExtension(pi: PiApi): void {
       name: "bash",
       label: scopedGitOnly ? "Scoped Git" : "Sandboxed Bash",
       description: scopedGitOnly
-        ? "Run one allowlisted Git command in the admitted workspace. Allowed forms: git status, git log, git diff, git add with admitted paths, git mv between admitted paths, and git commit -m. General shell commands are denied."
+        ? "Run one allowlisted Git command in the admitted workspace. Allowed forms: git status, git log, git diff, git add with admitted paths, git mv between admitted paths, and git commit -m '<subject>' with up to two --trailer 'Key: value' flags for attribution trailers. General shell commands are denied."
         : "Run one command inside a networkless bubblewrap sandbox limited to the admitted workspace.",
       parameters: z.object({
         command: z.string().describe(scopedGitOnly ? "One exact allowlisted Git command" : "Command to run"),
