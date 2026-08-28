@@ -34,9 +34,11 @@ process-group evidence remains authoritative.
 
 ## Protocol v2 source staging
 
-Protocol v2 is source-only until the dedicated launchers, socket access controls, and policy
-artefacts are reviewed and installed together. Do not point a live Hermes caller at these
-source files.
+Protocol v2 requires dedicated launchers, named sockets, endpoint users, socket access
+controls and one private lease store per endpoint. The generic user-service templates and
+the `omp-invoke.py` command-line entry point are protocol-v1 compatibility surfaces; they
+cannot start or call the protocol-v2 broker `main()`. Do not use the generic socket as a
+rollback or point a v1 client at a named v2 endpoint.
 
 The broker requires one unique systemd `FileDescriptorName` for each listener. The accepted
 listener name fixes the endpoint, and Unix `SO_PEERCRED` supplies the exact peer UID. The

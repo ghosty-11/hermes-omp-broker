@@ -17,6 +17,19 @@ Choose two identities:
 
 Do not continue if the caller can read the coding identity's credential store.
 
+## Protocol version boundary
+
+The broker `main()` accepts only protocol-v2 named listeners. A v2 deployment must provide
+one `FileDescriptorName`, private lease store and exact endpoint user for every listener
+through deployment-owned units and the `HERMES_OMP_LEASE_DIRS` and
+`HERMES_OMP_ENDPOINT_USERS` variables.
+
+The generic `systemd/omp-delegate-broker.*` templates and the `omp-invoke.py` command-line
+entry point describe the protocol-v1 compatibility surface. They do not form a runnable
+deployment with the v2 broker `main()`. Do not enable the generic socket against the v2
+broker. A deployment that needs protocol v2 must supply its named sockets, lease issuer and
+dedicated launcher identities together.
+
 ## Coding-identity installation
 
 From a pinned checkout, as the coding identity:
@@ -65,19 +78,24 @@ access through the operator-selected group without granting it read access to th
 environment, policy, credentials, state, or repositories beyond its admitted working
 paths.
 
-Enable the socket only after reviewing both unit files:
+Do not enable the generic socket against the protocol-v2 broker. Install and activate only
+deployment-owned named socket units after you verify that every listener has:
 
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now omp-delegate-broker.socket
-systemctl --user status omp-delegate-broker.socket
-```
+- A unique `FileDescriptorName`.
+- An entry in `HERMES_OMP_LEASE_DIRS`.
+- An entry in `HERMES_OMP_ENDPOINT_USERS`.
+- A dedicated launcher that mints and redeems one-shot leases.
+
+Starting the generic socket with the v2 broker fails closed before accepting work.
 
 ## Caller installation
 
-As the restricted Hermes identity, copy `client/omp-invoke.py` to a private executable path
-and install `plugin/` through the installed Hermes standalone-plugin discovery seam. Install
-`skills/hermes-omp-delegation/` as one discoverable Agent Skill from this canonical source.
+Protocol-v2 callers do not send prompts or authority fields through the socket. Install a
+dedicated launcher that owns its lease store, fixes the request before issuance and imports
+`invoke_broker_v2()` from `client/omp-invoke.py`.
+
+The `omp-invoke.py` command-line entry point and `plugin/` implement the protocol-v1
+compatibility client. Do not point them at a protocol-v2 named endpoint.
 Configure these caller-side values:
 
 ```text
@@ -110,12 +128,12 @@ as documented.
 
 ## Upgrade and removal
 
-Stop admission by disabling the Hermes tool, then stop the socket and service. Back up the
-current package bytes, policy, environment, and state outside the install paths. Install the
-new pinned bytes, run the deterministic suite and disposable acceptance scenarios, then
-re-enable the socket and tool. To roll back, disable the tool, restore the previous pinned
-bytes and policy, run `systemctl --user daemon-reload`, restart the socket, and repeat
-admission plus one bounded disposable-repository smoke.
+Back up the current package bytes, policy, environment, units and private lease stores
+outside the install paths. Install the new pinned bytes, run the deterministic suite and
+disposable acceptance scenarios, then activate the deployment-owned named sockets. To roll
+back, restore those bytes and units, run `systemctl daemon-reload` in the unit manager that
+owns them, and repeat the negative authorization matrix plus one bounded
+disposable-repository smoke test. Do not use the generic v1 socket as a v2 rollback.
 
 For removal, disable the Hermes tool first, then:
 
