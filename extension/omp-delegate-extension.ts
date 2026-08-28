@@ -66,6 +66,7 @@ const AMBIGUOUS_PATH = /[\0\\\u00A0\u2000-\u200A\u202F\u205F\u3000]/;
 type Context = { cwd: string; model?: { provider?: string; id?: string } };
 type ToolEvent = { toolName?: unknown; input?: unknown };
 type ToolCallDecision = { block: true; reason: string } | undefined;
+type SessionStopDecision = { continue: true; additionalContext: string } | undefined;
 type SchemaLike = {
   optional(): SchemaLike;
   describe(text: string): SchemaLike;
@@ -80,6 +81,7 @@ type ZodLike = {
 type PiApi = {
   zod: ZodLike;
   on(name: "tool_call", handler: (event: ToolEvent, context: Context) => ToolCallDecision): void;
+  on(name: "session_stop", handler: () => SessionStopDecision): void;
   registerTool(tool: Record<string, unknown>): void;
 };
 
@@ -612,6 +614,18 @@ function servedModel(context: Context | undefined): string | undefined {
 
 export default function ompDelegateExtension(pi: PiApi): void {
   let finalized = false;
+  let corrections = 0;
+  // A run that ends without broker_finalize leaves no typed result at all.
+  // Spend exactly one continuation, with the session context still intact, on
+  // asking for it; a second unfinalized stop settles and fails as before.
+  pi.on("session_stop", () => {
+    if (finalized || corrections > 0) return undefined;
+    corrections += 1;
+    return {
+      continue: true,
+      additionalContext: "This run cannot end: broker_finalize was never called, so the caller receives no result. Call broker_finalize exactly once, now, with the typed result of the work already done: a summary of at least 20 characters, newline-separated verification statements, newline-separated gaps, and a verdict of MET, PARTIALLY MET, or NOT MET. Report the work as it actually stands; do not start new work and do not call any other tool.",
+    };
+  });
   pi.on("tool_call", (event, context) => {
     const name = typeof event.toolName === "string" ? event.toolName : "";
     const research = isResearchCaller();

@@ -42,6 +42,7 @@ for (const event of {json.dumps(events)}) {{
   if (event.kind === "tool_definition") output.push(tools.get(String(event.name)));
   else if (event.kind === "broker_finalize") output.push(await (tools.get("broker_finalize") as any).execute("id", event.input));
   else if (event.kind === "final_file") output.push(JSON.parse(readFileSync({json.dumps(str(final))}, "utf8")));
+  else if (event.kind === "session_stop") output.push(await handlers.get("session_stop")!(event, ctx) ?? null);
   else output.push(await handlers.get("tool_call")!(event,ctx));
 }}
 console.log(JSON.stringify(output));''')
@@ -271,6 +272,48 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
         ])
         self.assertTrue(results[0]["isError"])
         self.assertIsNone(results[1])
+
+    GOOD_FINAL = {
+        "kind": "broker_finalize",
+        "input": {
+            "summary": "The requested bounded change is complete.",
+            "verification": "git status --short returned empty",
+            "gaps": "",
+            "verdict": "MET",
+        },
+    }
+
+    def test_unfinalized_stop_earns_one_corrective_continuation(self) -> None:
+        """A run that never called broker_finalize dies with an absent final
+        file. One continuation, with the session context still intact, is the
+        cheapest chance to recover the typed result."""
+        [response] = self.exercise([{"kind": "session_stop"}])
+        self.assertTrue(response["continue"])
+        self.assertIn("broker_finalize", response["additionalContext"])
+
+    def test_corrective_continuation_is_offered_exactly_once(self) -> None:
+        """If the model ignores the correction the run must fail as before,
+        never loop."""
+        first, second = self.exercise([
+            {"kind": "session_stop"},
+            {"kind": "session_stop"},
+        ])
+        self.assertTrue(first["continue"])
+        self.assertIsNone(second)
+
+    def test_finalized_stop_settles_without_continuation(self) -> None:
+        _, response = self.exercise([self.GOOD_FINAL, {"kind": "session_stop"}])
+        self.assertIsNone(response)
+
+    def test_finalize_during_the_corrective_turn_settles_the_run(self) -> None:
+        first, recorded, second = self.exercise([
+            {"kind": "session_stop"},
+            self.GOOD_FINAL,
+            {"kind": "session_stop"},
+        ])
+        self.assertTrue(first["continue"])
+        self.assertFalse(recorded.get("isError", False))
+        self.assertIsNone(second)
 
     def test_scoped_git_binds_only_the_linked_common_directory(self) -> None:
         with tempfile.TemporaryDirectory() as td:
