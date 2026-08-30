@@ -348,6 +348,13 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
         self.assertTrue(response["continue"])
         self.assertIn("broker_finalize", response["additionalContext"])
 
+    def test_review_corrective_continuation_requires_findings(self) -> None:
+        [response] = self.exercise(
+            [{"kind": "session_stop"}],
+            caller="review-agent",
+        )
+        self.assertIn("structured findings", response["additionalContext"])
+
     def test_corrective_continuation_is_offered_exactly_once(self) -> None:
         """If the model ignores the correction the run must fail as before,
         never loop."""

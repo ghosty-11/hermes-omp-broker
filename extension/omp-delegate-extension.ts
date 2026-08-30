@@ -674,7 +674,9 @@ export default function ompDelegateExtension(pi: PiApi): void {
     corrections += 1;
     return {
       continue: true,
-      additionalContext: "This run cannot end: broker_finalize was never called, so the caller receives no result. Call broker_finalize exactly once, now, with the typed result of the work already done: a summary of at least 20 characters, newline-separated verification statements, newline-separated gaps, and a verdict of MET, PARTIALLY MET, or NOT MET. Report the work as it actually stands; do not start new work and do not call any other tool.",
+      additionalContext: isReviewCaller()
+        ? "This review run cannot end: broker_finalize was never called, so the caller receives no result. Call broker_finalize exactly once, now, with the typed result of the review already completed: a summary of at least 20 characters, newline-separated verification statements, newline-separated gaps, a verdict of MET, PARTIALLY MET, or NOT MET, and structured findings using file, lines, severity, issue, and fix. Report the review as it actually stands; do not start new work and do not call any other tool."
+        : "This run cannot end: broker_finalize was never called, so the caller receives no result. Call broker_finalize exactly once, now, with the typed result of the work already done: a summary of at least 20 characters, newline-separated verification statements, newline-separated gaps, and a verdict of MET, PARTIALLY MET, or NOT MET. Report the work as it actually stands; do not start new work and do not call any other tool.",
     };
   });
   pi.on("tool_call", (event, context) => {
