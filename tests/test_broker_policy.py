@@ -48,6 +48,45 @@ class BrokerPolicyTest(unittest.TestCase):
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
             return module
+
+    def test_review_findings_are_caller_scoped_and_typed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            policy = root / "policy.json"
+            policy.write_text(json.dumps({
+                "model": "provider/model",
+                "repositories": {},
+                "callers": {},
+            }))
+            module = self._load_broker(policy, root / "jobs")
+            final_path = root / "final.json"
+            final = {
+                "summary": "The exact-head review found one approved defect.",
+                "verification": ["exact pull head verified"],
+                "gaps": [],
+                "verdict": "MET",
+                "findings": [{
+                    "file": "backlog/triage/Target.md",
+                    "lines": [12],
+                    "severity": "medium",
+                    "issue": "The path is stale.",
+                    "fix": "Point it at the archive.",
+                }],
+            }
+            final_path.write_text(json.dumps(final))
+            self.assertEqual(
+                final,
+                module._valid_final(final_path, caller="review-agent"),
+            )
+            self.assertIsNone(
+                module._valid_final(final_path, caller="delegate_to_omp")
+            )
+            final["findings"][0]["lines"] = [0]
+            final_path.write_text(json.dumps(final))
+            self.assertIsNone(
+                module._valid_final(final_path, caller="review-agent")
+            )
+
     def test_an_existing_worktree_of_the_mapped_repo_is_admitted(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

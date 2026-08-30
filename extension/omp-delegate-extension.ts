@@ -23,6 +23,7 @@ const ALLOWED_TOOLS: Record<string, true> = {
   broker_finalize: true,
 };
 const RESEARCH_CALLER = "backlog-maturation-research";
+const REVIEW_CALLER = "review-agent";
 const RESEARCH_AGENTS: Record<string, "sonnet" | "fable"> = {
   "backlog-researcher": "sonnet",
   "backlog-vision": "sonnet",
@@ -92,6 +93,10 @@ function blocked(reason: string): ToolCallDecision {
 function isResearchCaller(): boolean {
   return (process.env.OMP_DELEGATE_CALLER ?? "") === RESEARCH_CALLER;
 }
+function isReviewCaller(): boolean {
+  return (process.env.OMP_DELEGATE_CALLER ?? "") === REVIEW_CALLER;
+}
+
 
 
 function researchTaskAllowed(input: unknown): string | undefined {
@@ -570,18 +575,56 @@ async function runSandboxedBash(
   };
 }
 
+type Finding = {
+  file: string;
+  lines: number[];
+  severity: "low" | "medium" | "high" | "critical";
+  issue: string;
+  fix: string;
+};
 type FinalResult = {
   summary: string;
   verification: string[];
   gaps: string[];
   verdict: "MET" | "PARTIALLY MET" | "NOT MET";
   served_model?: string;
+  findings?: Finding[];
 };
 
 function meaningfulLines(value: string): string[] | null {
   const lines = value.split("\n").map((line) => line.trim()).filter(Boolean);
   if (lines.length > 50 || lines.some((line) => line.length < 4 || line.length > 1_000)) return null;
   return lines;
+}
+
+function normalizeFinding(value: unknown): Finding | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const finding = value as Record<string, unknown>;
+  const keys = Object.keys(finding);
+  const expected = ["file", "fix", "issue", "lines", "severity"];
+  if (keys.length !== expected.length || keys.some((key) => !expected.includes(key))) return null;
+  const file = finding.file;
+  const lines = finding.lines;
+  const severity = finding.severity;
+  const issue = finding.issue;
+  const fix = finding.fix;
+  if (typeof file !== "string" || file.length < 1 || file.length > 1_000
+    || isAbsolute(file) || AMBIGUOUS_PATH.test(file) || file.includes("\n")
+    || file.split("/").some((part) => !part || part === "." || part === "..")) return null;
+  if (!Array.isArray(lines) || lines.length < 1 || lines.length > 20
+    || lines.some((line) => !Number.isInteger(line) || line < 1 || line > 10_000_000)
+    || new Set(lines).size !== lines.length
+    || lines.some((line, index) => index > 0 && Number(lines[index - 1]) >= Number(line))) return null;
+  if (!["low", "medium", "high", "critical"].includes(String(severity))) return null;
+  if (typeof issue !== "string" || issue.trim().length < 4 || issue.length > 2_000
+    || typeof fix !== "string" || fix.trim().length < 4 || fix.length > 2_000) return null;
+  return {
+    file,
+    lines: lines as number[],
+    severity: severity as Finding["severity"],
+    issue: issue.trim(),
+    fix: fix.trim(),
+  };
 }
 
 function normalizeFinal(value: unknown): FinalResult | null {
@@ -600,7 +643,15 @@ function normalizeFinal(value: unknown): FinalResult | null {
   if (verdict === "MET" && (verification.length === 0 || gaps.length !== 0)) return null;
   if (verdict === "PARTIALLY MET" && (verification.length === 0 || gaps.length === 0)) return null;
   if (verdict === "NOT MET" && gaps.length === 0) return null;
-  return { summary, verification, gaps, verdict };
+  if (!isReviewCaller()) {
+    if ("findings" in value) return null;
+    return { summary, verification, gaps, verdict };
+  }
+  if (!("findings" in value) || !Array.isArray(value.findings)
+    || value.findings.length > 32) return null;
+  const findings = value.findings.map(normalizeFinding);
+  if (findings.some((finding) => finding === null)) return null;
+  return { summary, verification, gaps, verdict, findings: findings as Finding[] };
 }
 
 function servedModel(context: Context | undefined): string | undefined {
@@ -677,18 +728,35 @@ export default function ompDelegateExtension(pi: PiApi): void {
     };
     pi.registerTool(bashTool);
   }
+  const commonFinalizeParameters: Record<string, SchemaLike> = {
+    summary: z.string().describe("Meaningful outcome summary, at least 20 characters"),
+    verification: z.string().describe("Newline-separated verification statements; required for MET and PARTIALLY MET"),
+    gaps: z.string().describe("Newline-separated gaps; required for PARTIALLY MET and NOT MET; empty for MET"),
+    verdict: z.enum(["MET", "PARTIALLY MET", "NOT MET"]),
+  };
+  const findingParameters = z.object({
+    file: z.string().describe("Repository-relative path"),
+    lines: z.array(z.number()).describe("Sorted positive source lines"),
+    severity: z.enum(["low", "medium", "high", "critical"]),
+    issue: z.string().describe("Actionable defect"),
+    fix: z.string().describe("Bounded correction"),
+  });
+  const finalizeParameters = z.object(isReviewCaller()
+    ? {
+      ...commonFinalizeParameters,
+      findings: z.array(findingParameters).describe("Typed review findings; empty only when the review found no actionable defects"),
+    }
+    : commonFinalizeParameters);
+
 
 
   pi.registerTool({
     name: "broker_finalize",
     label: "Finalize broker result",
-    description: "Record the broker's required typed outcome. Call exactly once, after all edits and verification. Verification and gaps are newline-separated text, not arrays.",
-    parameters: z.object({
-      summary: z.string().describe("Meaningful outcome summary, at least 20 characters"),
-      verification: z.string().describe("Newline-separated verification statements; required for MET and PARTIALLY MET"),
-      gaps: z.string().describe("Newline-separated gaps; required for PARTIALLY MET and NOT MET; empty for MET"),
-      verdict: z.enum(["MET", "PARTIALLY MET", "NOT MET"]),
-    }),
+    description: isReviewCaller()
+      ? "Record the broker's required typed review outcome. Call exactly once. Findings are structured objects; verification and gaps are newline-separated text."
+      : "Record the broker's required typed outcome. Call exactly once, after all edits and verification. Verification and gaps are newline-separated text, not arrays.",
+    parameters: finalizeParameters,
     approval: "write",
     hidden: false,
     defaultInactive: false,

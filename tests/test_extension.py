@@ -19,6 +19,7 @@ class ExtensionTest(unittest.TestCase):
         write_patterns: list[str] | None = None,
         git_mode: str = "none",
         create_only: bool = False,
+        caller: str = "",
         existing_paths: list[str] | None = None,
     ) -> list[object]:
         with tempfile.TemporaryDirectory() as td:
@@ -54,7 +55,7 @@ console.log(JSON.stringify(output));''')
                 "OMP_DELEGATE_WRITE_PATTERNS": json.dumps(write_patterns or []),
                 "OMP_DELEGATE_GIT_MODE": git_mode,
                 "OMP_DELEGATE_CREATE_ONLY": "1" if create_only else "0",
-                "OMP_DELEGATE_CALLER": "",
+                "OMP_DELEGATE_CALLER": caller,
             }
             result = subprocess.run(["node", str(runner)], env=env, text=True, capture_output=True, check=False)
         self.assertEqual(0, result.returncode, result.stderr)
@@ -256,6 +257,62 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
         self.assertFalse(result.get("isError", False))
         self.assertEqual(["git status --short returned empty"], recorded["verification"])
         self.assertEqual([], recorded["gaps"])
+
+    def test_review_finalizer_records_structured_findings(self) -> None:
+        finding = {
+            "file": "backlog/triage/Harness Stack Ontology and Taxonomy.md",
+            "lines": [12],
+            "severity": "medium",
+            "issue": "The capture path points at the retired ideas location.",
+            "fix": "Point the capture path at the archived note.",
+        }
+        result, recorded = self.exercise([
+            {
+                "kind": "broker_finalize",
+                "input": {
+                    "summary": "The exact-head review found the approved defect.",
+                    "verification": "exact pull head verified",
+                    "gaps": "",
+                    "verdict": "MET",
+                    "findings": [finding],
+                },
+            },
+            {"kind": "final_file"},
+        ], caller="review-agent")
+        self.assertFalse(result.get("isError", False))
+        self.assertEqual([finding], recorded["findings"])
+
+    def test_findings_are_review_only_and_strict(self) -> None:
+        finding = {
+            "file": "backlog/triage/Target.md",
+            "lines": [12],
+            "severity": "medium",
+            "issue": "The path is stale.",
+            "fix": "Point it at the archive.",
+        }
+        [non_review] = self.exercise([{
+            "kind": "broker_finalize",
+            "input": {
+                "summary": "The bounded implementation completed successfully.",
+                "verification": "focused test passed",
+                "gaps": "",
+                "verdict": "MET",
+                "findings": [finding],
+            },
+        }])
+        self.assertTrue(non_review["isError"])
+        malformed = {**finding, "lines": [0]}
+        [review] = self.exercise([{
+            "kind": "broker_finalize",
+            "input": {
+                "summary": "The exact-head review found the approved defect.",
+                "verification": "exact pull head verified",
+                "gaps": "",
+                "verdict": "MET",
+                "findings": [malformed],
+            },
+        }], caller="review-agent")
+        self.assertTrue(review["isError"])
 
     def test_placeholder_finalize_is_rejected_without_locking_the_turn(self) -> None:
         results = self.exercise([

@@ -189,11 +189,15 @@ contains:
 - explicit gaps;
 - a verdict: `MET`, `PARTIALLY MET`, or `NOT MET`;
 - optional `served_model` (`provider/id`) recorded by `broker_finalize` from the
-  post-fallback extension context model.
+  post-fallback extension context model;
+- for the `review-agent` caller, a required `findings` list of bounded objects containing a
+  repository-relative file, sorted positive source lines, severity, issue and fix.
 
-A stored result without `served_model` remains valid. Client JSON output names both the
-policy-requested model and the served model; a missing served model is empty so a caller
-can treat it as a gap. The text format does not include those fields.
+A stored non-review result without `served_model` remains valid. A review result always carries
+`findings`, including an empty list when no actionable defect exists. The broker refuses
+`findings` from other callers. Client JSON output names both the policy-requested model and the
+served model and includes findings when present; a missing served model is empty so a caller can
+treat it as a gap. The text format does not include those fields.
 
 The broker persists a separate lifecycle status such as `completed`, `failed`, `cancelled`,
 `timed_out`, `orphaned`, or `delivery_failed`. The Hermes adapter independently compares the

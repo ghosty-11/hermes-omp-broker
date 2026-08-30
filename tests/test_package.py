@@ -62,7 +62,16 @@ class PackageTest(unittest.TestCase):
             {"summary", "verification", "gaps", "verdict"},
             set(final["required"]),
         )
-        self.assertEqual(set(final["required"]) | {"served_model"}, set(final["properties"]))
+        self.assertEqual(
+            set(final["required"]) | {"served_model", "findings"},
+            set(final["properties"]),
+        )
+        finding = schema["$defs"]["finding"]
+        self.assertEqual(
+            {"file", "lines", "severity", "issue", "fix"},
+            set(finding["required"]),
+        )
+        self.assertFalse(finding["additionalProperties"])
         self.assertEqual(
             "https://raw.githubusercontent.com/ghosty-11/hermes-omp-broker/main/"
             "schemas/coding-job.schema.json",

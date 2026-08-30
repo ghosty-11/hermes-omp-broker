@@ -30,7 +30,9 @@ STATUS_JOB_FIELDS = {
 STATUS_SUCCESS_FIELDS = {"version", "op", "ok", "job"}
 STATUS_ERROR_FIELDS = {"version", "op", "ok", "error"}
 FINAL_FIELDS = {"summary", "verification", "gaps", "verdict"}
-OPTIONAL_FINAL_FIELDS = {"served_model"}
+OPTIONAL_FINAL_FIELDS = {"served_model", "findings"}
+FINDING_FIELDS = {"file", "lines", "severity", "issue", "fix"}
+FINDING_SEVERITIES = {"low", "medium", "high", "critical"}
 FINAL_VERDICTS = {"MET", "PARTIALLY MET", "NOT MET"}
 HEALTH_SUCCESS_FIELDS = {"version", "op", "ok"}
 HEALTH_ERROR_FIELDS = {"version", "op", "ok", "error"}
@@ -276,6 +278,52 @@ def _recv_exact(conn: socket.socket, size: int) -> bytes:
     return bytes(chunks)
 
 
+def _valid_findings(value: object) -> bool:
+    if not isinstance(value, list) or len(value) > 32:
+        return False
+    for finding in value:
+        if not isinstance(finding, dict) or set(finding) != FINDING_FIELDS:
+            return False
+        file = finding.get("file")
+        path = Path(file) if isinstance(file, str) else None
+        if (
+            not isinstance(file, str)
+            or not file
+            or len(file) > 1_000
+            or "\\" in file
+            or "\n" in file
+            or path is None
+            or path.is_absolute()
+            or path.as_posix() != file
+            or any(part in ("", ".", "..") for part in path.parts)
+        ):
+            return False
+        lines = finding.get("lines")
+        if (
+            not isinstance(lines, list)
+            or not 1 <= len(lines) <= 20
+            or any(
+                not isinstance(line, int)
+                or isinstance(line, bool)
+                or not 1 <= line <= 10_000_000
+                for line in lines
+            )
+            or lines != sorted(set(lines))
+        ):
+            return False
+        if finding.get("severity") not in FINDING_SEVERITIES:
+            return False
+        for field in ("issue", "fix"):
+            text = finding.get(field)
+            if (
+                not isinstance(text, str)
+                or not 4 <= len(text.strip()) <= 2_000
+                or text != text.strip()
+            ):
+                return False
+    return True
+
+
 def _valid_final(value: object) -> bool:
     if not isinstance(value, dict):
         return False
@@ -295,6 +343,8 @@ def _valid_final(value: object) -> bool:
         served = value["served_model"]
         if not isinstance(served, str) or not served or len(served) > 512:
             return False
+    if "findings" in value and not _valid_findings(value["findings"]):
+        return False
     return True
 
 
@@ -552,6 +602,8 @@ def format_json_response(
         "requested_model": requested_model,
         "served_model": served if isinstance(served, str) else "",
     }
+    if "findings" in final:
+        value["findings"] = final["findings"]
     return json.dumps(value, separators=(",", ":")) + "\n"
 
 

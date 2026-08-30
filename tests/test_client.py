@@ -147,10 +147,21 @@ class TestOmpInvoke(unittest.TestCase):
                 "verification": [],
                 "gaps": [],
                 "verdict": "MET",
+                "findings": [{
+                    "file": "backlog/triage/Target.md",
+                    "lines": [12],
+                    "severity": "medium",
+                    "issue": "The path is stale.",
+                    "fix": "Point it at the archive.",
+                }],
             },
             "request_id": "id",
         }
         self.assertEqual(base["final"], self.module.validate_response(base)["final"])
+        malformed = json.loads(json.dumps(base))
+        malformed["final"]["findings"][0]["lines"] = [0]
+        with self.assertRaises(self.module.InvocationError):
+            self.module.validate_response(malformed)
         for changed in (
             {**base, "exit_code": 1},
             {**base, "timed_out": True},

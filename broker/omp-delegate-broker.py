@@ -186,6 +186,9 @@ RESPONSE_FIELDS = {
 }
 FINAL_FIELDS = {"summary", "verification", "gaps", "verdict"}
 OPTIONAL_FINAL_FIELDS = {"served_model"}
+FINDING_FIELDS = {"file", "lines", "severity", "issue", "fix"}
+FINDING_SEVERITIES = {"low", "medium", "high", "critical"}
+REVIEW_CALLER = "review-agent"
 FINAL_VERDICTS = {"MET", "PARTIALLY MET", "NOT MET"}
 SYSTEM_APPEND = (
     "You are an admitted OMP worker behind a fixed Hermes delegation boundary. "
@@ -792,7 +795,53 @@ def _kill_process_group(pid: int) -> None:
         pass
 
 
-def _valid_final(path: Path) -> dict[str, object] | None:
+def _valid_findings(value: object) -> bool:
+    if not isinstance(value, list) or len(value) > 32:
+        return False
+    for finding in value:
+        if not isinstance(finding, dict) or set(finding) != FINDING_FIELDS:
+            return False
+        file = finding.get("file")
+        path = Path(file) if isinstance(file, str) else None
+        if (
+            not isinstance(file, str)
+            or not file
+            or len(file) > 1_000
+            or "\\" in file
+            or "\n" in file
+            or path is None
+            or path.is_absolute()
+            or path.as_posix() != file
+            or any(part in ("", ".", "..") for part in path.parts)
+        ):
+            return False
+        lines = finding.get("lines")
+        if (
+            not isinstance(lines, list)
+            or not 1 <= len(lines) <= 20
+            or any(
+                not isinstance(line, int)
+                or isinstance(line, bool)
+                or not 1 <= line <= 10_000_000
+                for line in lines
+            )
+            or lines != sorted(set(lines))
+        ):
+            return False
+        if finding.get("severity") not in FINDING_SEVERITIES:
+            return False
+        for field in ("issue", "fix"):
+            text = finding.get(field)
+            if (
+                not isinstance(text, str)
+                or not 4 <= len(text.strip()) <= 2_000
+                or text != text.strip()
+            ):
+                return False
+    return True
+
+
+def _valid_final(path: Path, *, caller: str) -> dict[str, object] | None:
     try:
         value = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
@@ -800,7 +849,15 @@ def _valid_final(path: Path) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
     keys = set(value)
-    if not FINAL_FIELDS <= keys or not keys <= FINAL_FIELDS | OPTIONAL_FINAL_FIELDS:
+    allowed = FINAL_FIELDS | OPTIONAL_FINAL_FIELDS
+    if caller == REVIEW_CALLER:
+        allowed |= {"findings"}
+    if not FINAL_FIELDS <= keys or not keys <= allowed:
+        return None
+    if caller == REVIEW_CALLER:
+        if not _valid_findings(value.get("findings")):
+            return None
+    elif "findings" in value:
         return None
     if not isinstance(value.get("summary"), str) or not value["summary"]:
         return None
@@ -1060,7 +1117,7 @@ def _run_request_inner(request: Request, conn: socket.socket) -> dict[str, objec
             _ACTIVE_PROCESS_GROUP = None
             stdout = stdout_b.decode(errors="replace")
             stderr = stderr_b.decode(errors="replace")
-            final = _valid_final(final_path)
+            final = _valid_final(final_path, caller=request.caller)
             exit_code = process.returncode if process.returncode is not None else 1
             outcome = audit_outcome(
                 exit_code, timed_out, group_clear, final, disconnected.is_set(),
