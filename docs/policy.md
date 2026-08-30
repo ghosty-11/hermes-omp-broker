@@ -37,4 +37,32 @@ or MCP. Caller and model authority remain server policy.
 
 `workspace-write` permits the admitted repository. `read-only` denies writes and shell. `restricted-write` admits only relative paths matching configured patterns; shell stays denied unless `git_mode` is `scoped`, which permits bounded status, log, diff, add, and commit operations on those paths. Deployment overlays may add local repositories, identities, and values without modifying reusable package code.
 
+## Caller-specific workspace roots
+
+Use `workspace_roots` when a caller must work in an isolated mirror that does not
+share Git metadata with the repository's canonical path. The field maps an admitted
+repository key to a list of absolute root directories:
+
+```json
+{
+  "repositories": ["wiki"],
+  "workspace_roots": {
+    "wiki": ["/srv/review/worktrees/wiki"]
+  }
+}
+```
+
+The broker accepts an existing workspace only when all of the following conditions
+hold:
+
+- The requested path is a nonsymlink Git toplevel strictly beneath an exact configured
+  root.
+- The root belongs to the caller and an admitted repository key.
+- The workspace and canonical repository have the same normalized Git remote identity.
+
+The broker does not create roots, mirrors, or worktrees. Deployment code owns the
+precreated stage parent and its permissions. The trusted launcher creates only the
+exact final root declared by its root-owned manifest, then creates task worktrees
+beneath that root. A request cannot add or widen a workspace root.
+
 A dirty shared checkout fails closed unless an isolated worktree policy is selected. Public or untrusted profiles receive no broker tool. Caller and coding credentials remain separate.

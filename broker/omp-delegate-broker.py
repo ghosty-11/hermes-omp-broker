@@ -311,6 +311,88 @@ def is_worktree_of(candidate: Path, admitted: Path) -> bool:
     left, right = git_common_dir(cand), git_common_dir(adm)
     return left is not None and left == right
 
+def git_remote_identity(path: Path) -> str | None:
+    """Canonical remote identity for a trusted checkout or isolated mirror."""
+    try:
+        result = subprocess.run(
+            ["git", "-c", f"safe.directory={path.resolve()}", "-C", str(path),
+             "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    raw = result.stdout.strip().removesuffix("/")
+    for prefix in (
+        "git@github.com:", "https://github.com/", "http://github.com/",
+        "ssh://git@github.com/",
+    ):
+        if raw.startswith(prefix):
+            return "github.com/" + raw.removeprefix(prefix).removesuffix(".git")
+    return raw
+
+
+def caller_workspace_root_membership(
+    caller_policy: dict[str, object],
+    repository: str,
+    requested_workspace: Path,
+    admitted: Path | None,
+) -> tuple[bool, bool]:
+    """(under an admitted caller root, mapped to the canonical repository)."""
+    raw = caller_policy.get("workspace_roots", {})
+    repository_names = caller_policy.get("repositories", [])
+    if (
+        not isinstance(raw, dict)
+        or not isinstance(repository_names, list)
+        or not all(isinstance(name, str) for name in repository_names)
+    ):
+        raise ProtocolError("caller workspace_roots policy is invalid")
+    for key, values in raw.items():
+        if (
+            not isinstance(key, str)
+            or key not in repository_names
+            or key not in REPOSITORY_PATHS
+            or not isinstance(values, list)
+            or not all(isinstance(value, str) for value in values)
+        ):
+            raise ProtocolError("caller workspace_roots policy is invalid")
+    roots = raw.get(repository, [])
+    if not isinstance(roots, list):
+        raise ProtocolError("caller workspace_roots policy is invalid")
+    workspace = requested_workspace.resolve()
+    workspace_remote = git_remote_identity(workspace)
+    admitted_remote = (
+        git_remote_identity(admitted) if admitted is not None else None)
+    under_root = False
+    mapped = False
+    for value in roots:
+        root = Path(value)
+        if not root.is_absolute():
+            raise ProtocolError("caller workspace_roots policy is invalid")
+        resolved = root.resolve()
+        try:
+            relative = workspace.relative_to(resolved)
+        except ValueError:
+            continue
+        if (
+            relative == Path()
+            or root.is_symlink()
+            or not root.is_dir()
+            or requested_workspace.is_symlink()
+            or not workspace.is_dir()
+            or git_toplevel(workspace) != workspace
+        ):
+            continue
+        under_root = True
+        if (
+            admitted_remote is not None
+            and workspace_remote is not None
+            and workspace_remote == admitted_remote
+        ):
+            mapped = True
+    return under_root, mapped
+
+
 
 def _validate_peer_uid(peer_uid: int) -> None:
     allowed_uid = int(os.environ.get("HERMES_OMP_CALLER_UID", str(os.getuid())))
@@ -404,15 +486,20 @@ def validate_request(value: object, *, peer_uid: int | None) -> Request:
     caller = value["caller"]
     if caller not in ALLOWED_WORKSPACES:
         raise ProtocolError("caller is not allowlisted")
-    workspace = Path(value["workspace"]).resolve()
+    requested_workspace = Path(value["workspace"])
+    if requested_workspace.is_symlink():
+        raise ProtocolError("workspace is not allowlisted for caller")
+    workspace = requested_workspace.resolve()
     admitted = REPOSITORY_PATHS.get(value["repository"])
+    caller_policy = CALLER_POLICIES[caller]
+    rooted, root_mapped = caller_workspace_root_membership(
+        caller_policy, value["repository"], requested_workspace, admitted)
     allowed = {path.resolve() for path in ALLOWED_WORKSPACES[caller]}
+    linked = admitted is not None and is_worktree_of(workspace, admitted)
     mapped = admitted is not None and (
-        workspace == admitted.resolve() or is_worktree_of(workspace, admitted)
+        workspace == admitted.resolve() or linked or root_mapped
     )
-    if workspace not in allowed and not (
-        admitted is not None and is_worktree_of(workspace, admitted)
-    ):
+    if workspace not in allowed and not linked and not rooted:
         raise ProtocolError("workspace is not allowlisted for caller")
     if not mapped:
         raise ProtocolError("repository key does not map to requested workspace")
@@ -429,7 +516,6 @@ def validate_request(value: object, *, peer_uid: int | None) -> Request:
     timeout = float(timeout)
     if timeout <= 0 or timeout > effective_max_timeout(caller):
         raise ProtocolError("timeout is outside the broker bound")
-    caller_policy = CALLER_POLICIES[caller]
 
     def _string_tuple(field: str) -> tuple[str, ...]:
         raw = caller_policy.get(field, [])

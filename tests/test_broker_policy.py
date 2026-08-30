@@ -77,6 +77,109 @@ class BrokerPolicyTest(unittest.TestCase):
                 wt.resolve(),
                 module.validate_request(request, peer_uid=os.getuid()).workspace)
 
+            alias = root / "alias"
+            os.symlink(wt, alias, target_is_directory=True)
+            with self.assertRaisesRegex(
+                    module.ProtocolError, "workspace is not allowlisted"):
+                module.validate_request(
+                    {**request, "workspace": str(alias)},
+                    peer_uid=os.getuid())
+
+    def test_caller_repository_root_admits_only_matching_remote_worktrees(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            remote = root / "remote.git"
+            subprocess.run(
+                ["git", "init", "-q", "--bare", str(remote)], check=True)
+            canonical = root / "canonical"
+            subprocess.run(
+                ["git", "clone", "-q", str(remote), str(canonical)], check=True)
+            for key, value in (
+                ("user.email", "test@example.invalid"),
+                ("user.name", "test"),
+            ):
+                subprocess.run(
+                    ["git", "-C", str(canonical), "config", key, value],
+                    check=True)
+            (canonical / "f").write_text("x\n")
+            subprocess.run(
+                ["git", "-C", str(canonical), "add", "f"], check=True)
+            subprocess.run(
+                ["git", "-C", str(canonical), "commit", "-qm", "seed"],
+                check=True)
+            subprocess.run(
+                ["git", "-C", str(canonical), "push", "-q", "origin", "HEAD"],
+                check=True)
+            mirror = root / "mirror.git"
+            subprocess.run(
+                ["git", "clone", "-q", "--mirror", str(remote), str(mirror)],
+                check=True)
+            workspace_root = root / "review-worktrees"
+            workspace_root.mkdir()
+            workspace = workspace_root / "task"
+            subprocess.run(
+                ["git", "-C", str(mirror), "worktree", "add", "-q",
+                 str(workspace), "HEAD"],
+                check=True)
+            policy = root / "policy.json"
+            policy.write_text(json.dumps({
+                "repositories": {"allowed": {"path": str(canonical)}},
+                "callers": {"review": {
+                    "repositories": ["allowed"],
+                    "workspace_roots": {
+                        "allowed": [str(workspace_root)],
+                    },
+                    "sandbox": "restricted-write",
+                }},
+            }))
+            module = self._load_broker(policy, root / "jobs")
+            request = {
+                "version": 1, "request_id": "req", "task_id": "task",
+                "repository": "allowed", "caller": "review",
+                "workspace": str(workspace), "sandbox": "restricted-write",
+                "model": "provider/model", "prompt": "bounded", "timeout": 10,
+            }
+
+            try:
+                admitted = module.validate_request(
+                    request, peer_uid=os.getuid())
+            except module.ProtocolError as exc:
+                self.fail(f"valid caller workspace root was rejected: {exc}")
+            self.assertEqual(workspace.resolve(), admitted.workspace)
+
+            alias = workspace_root / "alias"
+            os.symlink(workspace, alias, target_is_directory=True)
+            with self.assertRaisesRegex(
+                    module.ProtocolError, "workspace is not allowlisted"):
+                module.validate_request(
+                    {**request, "workspace": str(alias)},
+                    peer_uid=os.getuid())
+
+            sibling = root / "sibling"
+            subprocess.run(
+                ["git", "-C", str(mirror), "worktree", "add", "-q",
+                 str(sibling), "HEAD"],
+                check=True)
+            with self.assertRaisesRegex(
+                    module.ProtocolError, "workspace is not allowlisted"):
+                module.validate_request(
+                    {**request, "workspace": str(sibling)},
+                    peer_uid=os.getuid())
+
+            forged = workspace_root / "forged"
+            subprocess.run(
+                ["git", "init", "-q", "-b", "main", str(forged)], check=True)
+            subprocess.run(
+                ["git", "-C", str(forged), "remote", "add", "origin",
+                 str(root / "other.git")],
+                check=True)
+            with self.assertRaisesRegex(
+                    module.ProtocolError, "repository key does not map"):
+                module.validate_request(
+                    {**request, "workspace": str(forged)},
+                    peer_uid=os.getuid())
+
+
     def test_git_identity_probe_trusts_only_the_exact_candidate_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td).resolve()
