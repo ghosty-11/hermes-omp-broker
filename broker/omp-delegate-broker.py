@@ -239,6 +239,7 @@ class Request:
     git_mode: str
     skills: tuple[str, ...]
     create_only: bool
+    hookless_commit: bool = False
     fallback_models: tuple[str, ...] | None = None
     fallback_selectors: tuple[str, ...] = ()
     protocol_version: int = 1
@@ -532,6 +533,12 @@ def validate_request(value: object, *, peer_uid: int | None) -> Request:
     create_only = caller_policy.get("create_only", False)
     if not isinstance(create_only, bool):
         raise ProtocolError("caller create-only policy is invalid")
+    # Repositories whose git hooks cannot execute inside the delegated bash
+    # sandbox mounts mark the caller hookless; the extension admits one
+    # trailing --no-verify on the commit contract form for them alone.
+    hookless_commit = caller_policy.get("hookless_commit", False)
+    if not isinstance(hookless_commit, bool):
+        raise ProtocolError("caller hookless-commit policy is invalid")
     fallback_selectors = _string_tuple("fallback_selectors")
     if any(not _valid_fallback_model(item) for item in fallback_selectors):
         raise ProtocolError("caller fallback_selectors policy is invalid")
@@ -540,6 +547,7 @@ def validate_request(value: object, *, peer_uid: int | None) -> Request:
         value["sandbox"], value["model"], prompt, timeout,
         _string_tuple("read_paths"), _string_tuple("write_patterns"),
         str(git_mode), _string_tuple("skills"), create_only,
+        hookless_commit,
         _caller_fallback_models(caller_policy), fallback_selectors,
     )
 
@@ -609,6 +617,7 @@ def omp_environment(
         "OMP_DELEGATE_WRITE_PATTERNS": json.dumps(request.write_patterns),
         "OMP_DELEGATE_GIT_MODE": request.git_mode,
         "OMP_DELEGATE_CREATE_ONLY": "1" if request.create_only else "0",
+        "OMP_DELEGATE_HOOKLESS_COMMIT": "1" if request.hookless_commit else "0",
         "OMP_DELEGATE_CALLER": request.caller,
     }
     if request.git_mode == "scoped":

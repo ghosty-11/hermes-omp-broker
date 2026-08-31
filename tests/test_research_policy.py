@@ -335,6 +335,38 @@ class ResearchPolicyBrokerTest(unittest.TestCase):
                 os.environ, final_path=Path(td) / "final.json", request=writer)
             self.assertEqual(WRITER, writer_env["OMP_DELEGATE_CALLER"])
 
+    def test_hookless_commit_flag_flows_from_caller_policy_only(self) -> None:
+        """hookless_commit is policy authority, never request authority: the
+        delegated bash sandbox cannot run repository git hooks whose runtimes
+        resolve through the user's home, so policy marks such callers
+        hookless and the flag alone widens the scoped-git commit grammar
+        with one trailing --no-verify."""
+        with tempfile.TemporaryDirectory() as td:
+            policy = _policy(td)
+            policy["callers"][WRITER]["hookless_commit"] = True
+            module = load_broker(policy, td)
+            marked = module.validate_request(
+                _request(td, caller=WRITER), peer_uid=os.getuid())
+            env = module.omp_environment(
+                os.environ, final_path=Path(td) / "final.json", request=marked)
+            self.assertEqual("1", env["OMP_DELEGATE_HOOKLESS_COMMIT"])
+
+        with tempfile.TemporaryDirectory() as td:
+            module = load_broker(_policy(td), td)
+            unmarked = module.validate_request(
+                _request(td, caller=WRITER), peer_uid=os.getuid())
+            env = module.omp_environment(
+                os.environ, final_path=Path(td) / "final.json", request=unmarked)
+            self.assertEqual("0", env["OMP_DELEGATE_HOOKLESS_COMMIT"])
+
+        with tempfile.TemporaryDirectory() as td:
+            policy = _policy(td)
+            policy["callers"][WRITER]["hookless_commit"] = "yes"
+            module = load_broker(policy, td)
+            with self.assertRaisesRegex(module.ProtocolError, "hookless"):
+                module.validate_request(
+                    _request(td, caller=WRITER), peer_uid=os.getuid())
+
     def test_fallback_models_are_caller_policy_specific(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             module = load_broker(_policy(td), td)

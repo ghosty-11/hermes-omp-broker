@@ -21,6 +21,7 @@ class ExtensionTest(unittest.TestCase):
         create_only: bool = False,
         caller: str = "",
         existing_paths: list[str] | None = None,
+        hookless_commit: bool = False,
     ) -> list[object]:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -56,6 +57,7 @@ console.log(JSON.stringify(output));''')
                 "OMP_DELEGATE_GIT_MODE": git_mode,
                 "OMP_DELEGATE_CREATE_ONLY": "1" if create_only else "0",
                 "OMP_DELEGATE_CALLER": caller,
+                "OMP_DELEGATE_HOOKLESS_COMMIT": "1" if hookless_commit else "0",
             }
             result = subprocess.run(["node", str(runner)], env=env, text=True, capture_output=True, check=False)
         self.assertEqual(0, result.returncode, result.stderr)
@@ -159,6 +161,58 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
         self.assertTrue(results[3]["block"], "unquoted trailer values stay denied")
         self.assertTrue(results[4]["block"], "a commit still needs a -m message")
         self.assertTrue(results[5]["block"], "--amend stays denied")
+
+    def test_scoped_git_commit_admits_no_verify_only_for_hookless_callers(self) -> None:
+        """The delegated bash sandbox (bwrap --unshare-all, HOME=/tmp/home,
+        workspace-only mounts) cannot execute repository git hooks whose
+        runtimes resolve through the user's home — venv interpreters
+        symlinked to managed toolchains, hook environment caches — so a
+        hook-bound worker commit can never land. Policy marks such callers
+        hookless (OMP_DELEGATE_HOOKLESS_COMMIT=1) and those callers alone
+        may append one trailing --no-verify to the exact commit contract
+        form; their writes stay confined by write-patterns and reviewed
+        after the run. Every other caller, position, and subcommand stays
+        denied.
+        """
+        hookless = dict(sandbox="restricted-write", write_patterns=["docs/report/*"], git_mode="scoped", hookless_commit=True)
+        hook_bound = dict(sandbox="restricted-write", write_patterns=["docs/*"], git_mode="scoped")
+
+        allowed = self.exercise([
+            {"toolName": "bash", "input": {"command": "git commit -m 'weekly reading' --no-verify"}},
+            {"toolName": "bash", "input": {"command": "git commit -m 'x' --trailer 'Run-Id: r1' --no-verify"}},
+            {"toolName": "bash", "input": {"command": "git commit -m 'weekly reading'"}},
+        ], **hookless)
+        self.assertIsNone(allowed[0], "a hookless caller may append one --no-verify")
+        self.assertIsNone(allowed[1], "trailers and --no-verify compose")
+        self.assertIsNone(allowed[2], "the plain contract form is unchanged")
+
+        shapes_denied = self.exercise([
+            {"toolName": "bash", "input": {"command": "git commit --no-verify -m 'x'"}},
+            {"toolName": "bash", "input": {"command": "git commit -m 'x' --no-verify --no-verify"}},
+            {"toolName": "bash", "input": {"command": "git commit -m 'x' --no-verify --amend"}},
+            {"toolName": "bash", "input": {"command": "git push --no-verify"}},
+            {"toolName": "bash", "input": {"command": "git add --no-verify docs/report/r.md"}},
+        ], **hookless)
+        for index, why in enumerate((
+            "leading placement stays denied",
+            "one --no-verify only",
+            "--amend still denied",
+            "--no-verify admits no other subcommand",
+            "not even on add",
+        )):
+            self.assertTrue(shapes_denied[index]["block"], why)
+
+        denied_hook_bound = self.exercise([
+            {"toolName": "bash", "input": {"command": "git commit -m 'fold note' --no-verify"}},
+            {"toolName": "bash", "input": {"command": "git commit -m 'x' --trailer 'Run-Id: r1' --no-verify"}},
+        ], **hook_bound)
+        self.assertTrue(denied_hook_bound[0]["block"], "hook-bound callers keep the hook-bound form")
+        self.assertTrue(denied_hook_bound[1]["block"], "trailers do not smuggle --no-verify past the flag")
+
+        unchanged_hook_bound = self.exercise([
+            {"toolName": "bash", "input": {"command": "git commit -m 'fold note' --trailer 'Run-Id: r1'"}},
+        ], **hook_bound)
+        self.assertIsNone(unchanged_hook_bound[0], "the hook-bound contract form is unchanged")
 
     def test_scoped_git_reads_any_branch_range(self) -> None:
         """diff/log must accept real branch names, not only HEAD and main.
@@ -457,6 +511,26 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
         for command in ("git status", "git log", "git diff", "git add", "git mv", "git commit"):
             self.assertIn(command, definition["description"])
         self.assertIn("General shell commands are denied", definition["description"])
+
+    def test_hookless_caller_description_names_the_hookless_commit_form(self) -> None:
+        """The description is the worker's only way to know hooks cannot run
+        in its sandbox; without it the worker leaves the run staged and
+        hook-blocked."""
+        [hookless] = self.exercise(
+            [{"kind": "tool_definition", "name": "bash"}],
+            sandbox="restricted-write",
+            write_patterns=["docs/report/*"],
+            git_mode="scoped",
+            hookless_commit=True,
+        )
+        self.assertIn("--no-verify", hookless["description"])
+        [hook_bound] = self.exercise(
+            [{"kind": "tool_definition", "name": "bash"}],
+            sandbox="restricted-write",
+            write_patterns=["docs/*"],
+            git_mode="scoped",
+        )
+        self.assertNotIn("--no-verify", hook_bound["description"])
 
     def test_boundary_tools_are_always_visible_to_the_model(self) -> None:
         definitions = self.exercise([

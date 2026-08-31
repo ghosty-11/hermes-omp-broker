@@ -387,8 +387,27 @@ function scopedGitCommandAllowed(input: unknown, workspace: string): boolean {
   // trailer lines, but the one-command grammar cannot carry a newline and
   // three -m args stay denied; --trailer emits canonical trailer lines from
   // single-line "Key: value" arguments (g7, 2026-08-26).
-  return subcommand === "commit"
-    && /^git commit(?: -m (?:'[^']+'|"[^"]+")){1,2}(?: --trailer (?:'[^'\n]+: [^'\n]+'|"[^"\n]+: [^"\n]+")){0,2}$/.test(command);
+  //
+  // Some admitted callers commit in repositories whose git hooks cannot
+  // execute inside the delegated bash sandbox: bwrap mounts only the
+  // workspace plus system roots, so hook runtimes that resolve through the
+  // user's home (venv interpreters symlinked to managed toolchains, hook
+  // environment caches) dangle. Policy marks such callers hookless and the
+  // broker passes OMP_DELEGATE_HOOKLESS_COMMIT=1; those callers alone may
+  // append ONE trailing --no-verify to the exact contract form. Their
+  // writes stay confined by write-patterns and reviewed after the run;
+  // every other caller keeps the hook-bound form.
+  if (subcommand === "commit") {
+    const hooklessCommit = process.env.OMP_DELEGATE_HOOKLESS_COMMIT === "1";
+    const subject = "(?: -m (?:'[^']+'|\"[^\"]+\")){1,2}";
+    const trailers =
+      "(?: --trailer (?:'[^'\\n]+: [^'\\n]+'|\"[^\"\\n]+: [^\"\\n]+\")){0,2}";
+    const grammar = new RegExp(
+      `^git commit${subject}${trailers}${hooklessCommit ? "(?: --no-verify)?" : ""}$`,
+    );
+    return grammar.test(command);
+  }
+  return false;
 }
 
 
@@ -708,11 +727,12 @@ export default function ompDelegateExtension(pi: PiApi): void {
   if (!isResearchCaller()) {
     const scopedGitOnly = process.env.OMP_DELEGATE_SANDBOX === "restricted-write"
       && process.env.OMP_DELEGATE_GIT_MODE === "scoped";
+    const hooklessCommit = process.env.OMP_DELEGATE_HOOKLESS_COMMIT === "1";
     const bashTool = {
       name: "bash",
       label: scopedGitOnly ? "Scoped Git" : "Sandboxed Bash",
       description: scopedGitOnly
-        ? "Run one allowlisted Git command in the admitted workspace. Allowed forms: git status, git log, git diff, git add with admitted paths, git mv between admitted paths, and git commit -m '<subject>' with up to two --trailer 'Key: value' flags for attribution trailers. General shell commands are denied."
+        ? `Run one allowlisted Git command in the admitted workspace. Allowed forms: git status, git log, git diff, git add with admitted paths, git mv between admitted paths, and git commit -m '<subject>' with up to two --trailer 'Key: value' flags for attribution trailers${hooklessCommit ? ", plus one trailing --no-verify (git hooks cannot execute in this sandbox — commit with it rather than leaving the work staged)" : ""}. General shell commands are denied.`
         : "Run one command inside a networkless bubblewrap sandbox limited to the admitted workspace.",
       parameters: z.object({
         command: z.string().describe(scopedGitOnly ? "One exact allowlisted Git command" : "Command to run"),
