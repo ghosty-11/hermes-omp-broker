@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import os
+import sys
+from pathlib import Path
+module_root = Path(__file__).resolve().parents[1]
+control = Path(os.environ.get("HARNESS_STACK_CONTROL", module_root.parents[1] / "control" / "harness-stack-control"))
+engine = control / "deploy" / "module_deploy.py"
+if not engine.is_file():
+    raise SystemExit(f"deployment engine not found: {engine}")
+os.execv(sys.executable, [sys.executable, str(engine), *sys.argv[1:], "--module-root", str(module_root)])

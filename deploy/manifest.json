@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "module": "hermes-omp-broker",
+  "artifacts": [
+    {"source": "plugin", "destination": "plugins/hermes-omp-delegate", "kind": "tree"},
+    {"source": "client/omp-invoke.py", "destination": "scripts/omp-invoke.py", "kind": "file"},
+    {"source": "extension/omp-delegate-extension.ts", "destination": "omp-delegate-broker/extension.ts", "kind": "file"},
+    {"source": "broker", "destination": "omp-delegate-broker/broker", "kind": "tree"},
+    {"source": "skills/hermes-omp-delegation", "destination": "skills/hermes-omp-delegation", "kind": "tree"},
+    {"source": "systemd", "destination": "omp-delegate-broker/systemd", "kind": "tree"}
+  ]
+}
