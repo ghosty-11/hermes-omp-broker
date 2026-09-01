@@ -223,6 +223,11 @@ def effective_max_timeout(caller: str) -> float:
     return min(float(value), ABSOLUTE_MAX_TIMEOUT)
 
 
+def caller_allows_structured_result(caller: str) -> bool:
+    """Whether policy admits one bounded project-owned JSON result."""
+    return CALLER_POLICIES.get(caller, {}).get("structured_result") is True
+
+
 @dataclasses.dataclass(frozen=True)
 class Request:
     request_id: str
@@ -240,6 +245,7 @@ class Request:
     skills: tuple[str, ...]
     create_only: bool
     hookless_commit: bool = False
+    structured_result: bool = False
     fallback_models: tuple[str, ...] | None = None
     fallback_selectors: tuple[str, ...] = ()
     protocol_version: int = 1
@@ -539,6 +545,9 @@ def validate_request(value: object, *, peer_uid: int | None) -> Request:
     hookless_commit = caller_policy.get("hookless_commit", False)
     if not isinstance(hookless_commit, bool):
         raise ProtocolError("caller hookless-commit policy is invalid")
+    structured_result = caller_policy.get("structured_result", False)
+    if not isinstance(structured_result, bool):
+        raise ProtocolError("caller structured-result policy is invalid")
     fallback_selectors = _string_tuple("fallback_selectors")
     if any(not _valid_fallback_model(item) for item in fallback_selectors):
         raise ProtocolError("caller fallback_selectors policy is invalid")
@@ -547,7 +556,7 @@ def validate_request(value: object, *, peer_uid: int | None) -> Request:
         value["sandbox"], value["model"], prompt, timeout,
         _string_tuple("read_paths"), _string_tuple("write_patterns"),
         str(git_mode), _string_tuple("skills"), create_only,
-        hookless_commit,
+        hookless_commit, structured_result,
         _caller_fallback_models(caller_policy), fallback_selectors,
     )
 
@@ -619,6 +628,7 @@ def omp_environment(
         "OMP_DELEGATE_CREATE_ONLY": "1" if request.create_only else "0",
         "OMP_DELEGATE_HOOKLESS_COMMIT": "1" if request.hookless_commit else "0",
         "OMP_DELEGATE_CALLER": request.caller,
+        "OMP_DELEGATE_STRUCTURED_RESULT": "1" if request.structured_result else "0",
     }
     if request.git_mode == "scoped":
         env.update({
@@ -850,6 +860,16 @@ def _valid_findings(value: object) -> bool:
     return True
 
 
+def _valid_structured_result(value: object) -> bool:
+    if not isinstance(value, str) or len(value.encode()) > 500_000:
+        return False
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict)
+
+
 def _valid_final(path: Path, *, caller: str) -> dict[str, object] | None:
     try:
         value = json.loads(path.read_text())
@@ -861,12 +881,19 @@ def _valid_final(path: Path, *, caller: str) -> dict[str, object] | None:
     allowed = FINAL_FIELDS | OPTIONAL_FINAL_FIELDS
     if caller == REVIEW_CALLER:
         allowed |= {"findings"}
+    if caller_allows_structured_result(caller):
+        allowed |= {"structured_result"}
     if not FINAL_FIELDS <= keys or not keys <= allowed:
         return None
     if caller == REVIEW_CALLER:
         if not _valid_findings(value.get("findings")):
             return None
     elif "findings" in value:
+        return None
+    if caller_allows_structured_result(caller):
+        if not _valid_structured_result(value.get("structured_result")):
+            return None
+    elif "structured_result" in value:
         return None
     if not isinstance(value.get("summary"), str) or not value["summary"]:
         return None

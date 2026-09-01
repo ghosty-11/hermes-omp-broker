@@ -22,6 +22,7 @@ class ExtensionTest(unittest.TestCase):
         caller: str = "",
         existing_paths: list[str] | None = None,
         hookless_commit: bool = False,
+        structured_result: bool = False,
     ) -> list[object]:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -58,6 +59,7 @@ console.log(JSON.stringify(output));''')
                 "OMP_DELEGATE_CREATE_ONLY": "1" if create_only else "0",
                 "OMP_DELEGATE_CALLER": caller,
                 "OMP_DELEGATE_HOOKLESS_COMMIT": "1" if hookless_commit else "0",
+                "OMP_DELEGATE_STRUCTURED_RESULT": "1" if structured_result else "0",
             }
             result = subprocess.run(["node", str(runner)], env=env, text=True, capture_output=True, check=False)
         self.assertEqual(0, result.returncode, result.stderr)
@@ -277,7 +279,7 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
         """Wiki filenames carry spaces; an unquotable path is an unusable boundary.
 
         The first live maturation run (2026-08-21) created
-        `backlog/triage/Market Oracle Agentic Upgrade Research.md` and could not
+        `backlog/triage/Agentic Upgrade Research.md` and could not
         `git add` or `git mv` it: the token splitter broke the path at each space,
         checked the fragments, and refused. The child left the whole run
         uncommitted, which the wrapper correctly reported as disagreement.
@@ -335,6 +337,32 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
         ], caller="review-agent")
         self.assertFalse(result.get("isError", False))
         self.assertEqual([finding], recorded["findings"])
+
+    def test_policy_enabled_finalizer_records_project_structured_result(self) -> None:
+        structured = json.dumps({
+            "summary": "Seven packet findings reviewed.",
+            "verification": ["packet validated"],
+            "gaps": [],
+            "verdict": "MET",
+            "served_model": "provider/model",
+            "findings": [{"finding_id": "obj.finding.one"}],
+        }, separators=(",", ":"))
+        result, recorded = self.exercise([
+            {
+                "kind": "broker_finalize",
+                "input": {
+                    "summary": "The structured review completed with typed findings.",
+                    "verification": "packet result finalized",
+                    "gaps": "",
+                    "verdict": "MET",
+                    "structured_result": structured,
+                },
+            },
+            {"kind": "final_file"},
+        ], caller="structured-review", structured_result=True)
+        self.assertFalse(result.get("isError", False))
+        self.assertEqual(structured, recorded["structured_result"])
+
 
     def test_findings_are_review_only_and_strict(self) -> None:
         finding = {

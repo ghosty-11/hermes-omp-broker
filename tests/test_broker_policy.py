@@ -87,6 +87,48 @@ class BrokerPolicyTest(unittest.TestCase):
                 module._valid_final(final_path, caller="review-agent")
             )
 
+    def test_policy_enabled_structured_result_is_scoped_json(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            policy = root / "policy.json"
+            policy.write_text(json.dumps({
+                "model": "provider/model",
+                "repositories": {},
+                "callers": {
+                    "structured-review": {"structured_result": True},
+                },
+            }))
+            module = self._load_broker(policy, root / "jobs")
+            final_path = root / "final.json"
+            structured = json.dumps(
+                {"summary": "typed", "findings": [{"finding_id": "obj.one"}]},
+                separators=(",", ":"),
+            )
+            final = {
+                "summary": "The structured review returned typed findings.",
+                "verification": ["packet finalized"],
+                "gaps": [],
+                "verdict": "MET",
+                "structured_result": structured,
+            }
+            final_path.write_text(json.dumps(final))
+            self.assertEqual(
+                final,
+                module._valid_final(
+                    final_path, caller="structured-review"
+                ),
+            )
+            self.assertIsNone(
+                module._valid_final(final_path, caller="delegate_to_omp")
+            )
+            final["structured_result"] = "not json"
+            final_path.write_text(json.dumps(final))
+            self.assertIsNone(
+                module._valid_final(
+                    final_path, caller="structured-review"
+                )
+            )
+
     def test_an_existing_worktree_of_the_mapped_repo_is_admitted(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

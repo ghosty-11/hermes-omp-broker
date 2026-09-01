@@ -173,6 +173,31 @@ class TestOmpInvoke(unittest.TestCase):
                 with self.assertRaises(self.module.InvocationError):
                     self.module.validate_response(changed)
 
+    def test_response_accepts_bounded_structured_result_json(self) -> None:
+        base = {
+            "version": 1,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+            "process_group_clear": True,
+            "final": {
+                "summary": "Structured review complete",
+                "verification": ["packet finalized"],
+                "gaps": [],
+                "verdict": "MET",
+                "structured_result": json.dumps(
+                    {"summary": "typed", "findings": []},
+                    separators=(",", ":"),
+                ),
+            },
+            "request_id": "id",
+        }
+        self.assertEqual(base["final"], self.module.validate_response(base)["final"])
+        base["final"]["structured_result"] = "not json"
+        with self.assertRaises(self.module.InvocationError):
+            self.module.validate_response(base)
+
     def test_caller_output_contains_structured_evidence(self) -> None:
         response = {
             "final": {
