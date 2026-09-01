@@ -30,7 +30,7 @@ STATUS_JOB_FIELDS = {
 STATUS_SUCCESS_FIELDS = {"version", "op", "ok", "job"}
 STATUS_ERROR_FIELDS = {"version", "op", "ok", "error"}
 FINAL_FIELDS = {"summary", "verification", "gaps", "verdict"}
-OPTIONAL_FINAL_FIELDS = {"served_model", "findings"}
+OPTIONAL_FINAL_FIELDS = {"served_model", "findings", "structured_result"}
 FINDING_FIELDS = {"file", "lines", "severity", "issue", "fix"}
 FINDING_SEVERITIES = {"low", "medium", "high", "critical"}
 FINAL_VERDICTS = {"MET", "PARTIALLY MET", "NOT MET"}
@@ -324,6 +324,16 @@ def _valid_findings(value: object) -> bool:
     return True
 
 
+def _valid_structured_result(value: object) -> bool:
+    if not isinstance(value, str) or len(value.encode()) > 500_000:
+        return False
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict)
+
+
 def _valid_final(value: object) -> bool:
     if not isinstance(value, dict):
         return False
@@ -344,6 +354,10 @@ def _valid_final(value: object) -> bool:
         if not isinstance(served, str) or not served or len(served) > 512:
             return False
     if "findings" in value and not _valid_findings(value["findings"]):
+        return False
+    if "structured_result" in value and not _valid_structured_result(
+        value["structured_result"]
+    ):
         return False
     return True
 

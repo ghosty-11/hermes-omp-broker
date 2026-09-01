@@ -96,6 +96,9 @@ function isResearchCaller(): boolean {
 function isReviewCaller(): boolean {
   return (process.env.OMP_DELEGATE_CALLER ?? "") === REVIEW_CALLER;
 }
+function usesStructuredResult(): boolean {
+  return process.env.OMP_DELEGATE_STRUCTURED_RESULT === "1";
+}
 
 
 
@@ -608,6 +611,7 @@ type FinalResult = {
   verdict: "MET" | "PARTIALLY MET" | "NOT MET";
   served_model?: string;
   findings?: Finding[];
+  structured_result?: string;
 };
 
 function meaningfulLines(value: string): string[] | null {
@@ -662,15 +666,27 @@ function normalizeFinal(value: unknown): FinalResult | null {
   if (verdict === "MET" && (verification.length === 0 || gaps.length !== 0)) return null;
   if (verdict === "PARTIALLY MET" && (verification.length === 0 || gaps.length === 0)) return null;
   if (verdict === "NOT MET" && gaps.length === 0) return null;
-  if (!isReviewCaller()) {
-    if ("findings" in value) return null;
-    return { summary, verification, gaps, verdict };
+  if (isReviewCaller()) {
+    if (!("findings" in value) || !Array.isArray(value.findings)
+      || value.findings.length > 32) return null;
+    const findings = value.findings.map(normalizeFinding);
+    if (findings.some((finding) => finding === null)) return null;
+    return { summary, verification, gaps, verdict, findings: findings as Finding[] };
   }
-  if (!("findings" in value) || !Array.isArray(value.findings)
-    || value.findings.length > 32) return null;
-  const findings = value.findings.map(normalizeFinding);
-  if (findings.some((finding) => finding === null)) return null;
-  return { summary, verification, gaps, verdict, findings: findings as Finding[] };
+  if (usesStructuredResult()) {
+    if (!("structured_result" in value)
+      || typeof value.structured_result !== "string"
+      || Buffer.byteLength(value.structured_result, "utf8") > 500_000) return null;
+    try {
+      const parsed = JSON.parse(value.structured_result);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    } catch {
+      return null;
+    }
+    return { summary, verification, gaps, verdict, structured_result: value.structured_result };
+  }
+  if ("findings" in value || "structured_result" in value) return null;
+  return { summary, verification, gaps, verdict };
 }
 
 function servedModel(context: Context | undefined): string | undefined {
@@ -695,7 +711,9 @@ export default function ompDelegateExtension(pi: PiApi): void {
       continue: true,
       additionalContext: isReviewCaller()
         ? "This review run cannot end: broker_finalize was never called, so the caller receives no result. Call broker_finalize exactly once, now, with the typed result of the review already completed: a summary of at least 20 characters, newline-separated verification statements, newline-separated gaps, a verdict of MET, PARTIALLY MET, or NOT MET, and structured findings using file, lines, severity, issue, and fix. Report the review as it actually stands; do not start new work and do not call any other tool."
-        : "This run cannot end: broker_finalize was never called, so the caller receives no result. Call broker_finalize exactly once, now, with the typed result of the work already done: a summary of at least 20 characters, newline-separated verification statements, newline-separated gaps, and a verdict of MET, PARTIALLY MET, or NOT MET. Report the work as it actually stands; do not start new work and do not call any other tool.",
+        : usesStructuredResult()
+          ? "This structured-result run cannot end: broker_finalize was never called. Call broker_finalize exactly once with summary, newline-separated verification and gaps, the honest verdict, and structured_result containing the exact project-required JSON object. Do not start new work or call another tool."
+          : "This run cannot end: broker_finalize was never called, so the caller receives no result. Call broker_finalize exactly once, now, with the typed result of the work already done: a summary of at least 20 characters, newline-separated verification statements, newline-separated gaps, and a verdict of MET, PARTIALLY MET, or NOT MET. Report the work as it actually stands; do not start new work and do not call any other tool.",
     };
   });
   pi.on("tool_call", (event, context) => {
@@ -768,7 +786,12 @@ export default function ompDelegateExtension(pi: PiApi): void {
       ...commonFinalizeParameters,
       findings: z.array(findingParameters).describe("Typed review findings; empty only when the review found no actionable defects"),
     }
-    : commonFinalizeParameters);
+    : usesStructuredResult()
+      ? {
+        ...commonFinalizeParameters,
+        structured_result: z.string().describe("Exact project-required JSON object encoded as a string"),
+      }
+      : commonFinalizeParameters);
 
 
 
@@ -777,7 +800,9 @@ export default function ompDelegateExtension(pi: PiApi): void {
     label: "Finalize broker result",
     description: isReviewCaller()
       ? "Record the broker's required typed review outcome. Call exactly once. Findings are structured objects; verification and gaps are newline-separated text."
-      : "Record the broker's required typed outcome. Call exactly once, after all edits and verification. Verification and gaps are newline-separated text, not arrays.",
+      : usesStructuredResult()
+        ? "Record the project-owned structured outcome exactly once. structured_result is the exact task-required JSON object encoded as a JSON string."
+        : "Record the broker's required typed outcome. Call exactly once, after all edits and verification. Verification and gaps are newline-separated text, not arrays.",
     parameters: finalizeParameters,
     approval: "write",
     hidden: false,
