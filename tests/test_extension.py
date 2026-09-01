@@ -467,6 +467,18 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
             ))
 
     def test_scoped_sandbox_commits_through_linked_worktree_metadata(self) -> None:
+        # This test EXECUTES the sandbox, not just its argv. GitHub-hosted
+        # runners forbid the namespace operations bwrap needs (loopback
+        # RTM_NEWADDR: Operation not permitted), so probe the capability
+        # first and skip with the reason wherever kernels refuse it.
+        bwrap = Path("/usr/bin/bwrap")
+        if not bwrap.exists():
+            self.skipTest("bubblewrap is not installed")
+        probe = subprocess.run(
+            [str(bwrap), "--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev", "true"],
+            capture_output=True, text=True, check=False)
+        if probe.returncode != 0:
+            self.skipTest(f"bubblewrap sandbox unavailable: {probe.stderr.strip()}")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             repo = root / "repo"
