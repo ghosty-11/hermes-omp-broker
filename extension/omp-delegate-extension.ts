@@ -227,7 +227,7 @@ function editPaths(input: unknown): string[] | null {
   return paths;
 }
 
-let cachedReadRoots: string[] | null = null;
+let cachedReadRoots: { workspace: string; roots: string[] } | null = null;
 
 function configuredReadRoots(workspace: string): string[] {
   // Memoized: grants are fixed per worker process, and every drop below must
@@ -238,18 +238,23 @@ function configuredReadRoots(workspace: string): string[] {
   // it, and the delegate produced its report from memory instead of the
   // granted inputs. Dropping stays the right BEHAVIOUR (fail closed to the
   // workspace); only the silence was the defect.
-  if (cachedReadRoots !== null) return cachedReadRoots;
+  // Keyed by workspace: the broker runs one session per worker process, but if
+  // a second session ever shared this process, serving it the first session's
+  // set would silently deny its own workspace and admit the other session's.
+  if (cachedReadRoots !== null && cachedReadRoots.workspace === workspace) {
+    return cachedReadRoots.roots;
+  }
   const warn = (message: string) => console.error(`omp-delegate: ${message}`);
   let values: unknown;
   try {
     values = JSON.parse(process.env.OMP_DELEGATE_READ_PATHS ?? "[]");
   } catch {
     warn("read grants ignored: OMP_DELEGATE_READ_PATHS is not valid JSON; only the workspace is admitted");
-    return (cachedReadRoots = [workspace]);
+    return (cachedReadRoots = { workspace, roots: [workspace] }).roots;
   }
   if (!Array.isArray(values) || !values.every((value) => typeof value === "string" && isAbsolute(value))) {
     warn("read grants ignored: OMP_DELEGATE_READ_PATHS is not an array of absolute paths; only the workspace is admitted");
-    return (cachedReadRoots = [workspace]);
+    return (cachedReadRoots = { workspace, roots: [workspace] }).roots;
   }
   const roots = [workspace];
   for (const value of values) {
@@ -271,7 +276,7 @@ function configuredReadRoots(workspace: string): string[] {
       warn(`dropped read root ${value}: not lstat-able by uid ${process.getuid?.() ?? "?"} (missing, or a path component denies traverse)`);
     }
   }
-  return (cachedReadRoots = roots);
+  return (cachedReadRoots = { workspace, roots }).roots;
 }
 
 function configuredWritePatterns(): RegExp[] {
