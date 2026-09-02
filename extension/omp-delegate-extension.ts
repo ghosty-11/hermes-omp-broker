@@ -227,35 +227,51 @@ function editPaths(input: unknown): string[] | null {
   return paths;
 }
 
+let cachedReadRoots: string[] | null = null;
+
 function configuredReadRoots(workspace: string): string[] {
+  // Memoized: grants are fixed per worker process, and every drop below must
+  // be announced exactly once. A grant the worker cannot use is REFUSED LOUDLY
+  // on stderr (which lands in the caller's delegate log) — the earlier silent
+  // fallback let a dead evidence grant go unnoticed for weeks: a caller policy
+  // granted a 0700 directory owned by another uid, this uid could not lstat
+  // it, and the delegate produced its report from memory instead of the
+  // granted inputs. Dropping stays the right BEHAVIOUR (fail closed to the
+  // workspace); only the silence was the defect.
+  if (cachedReadRoots !== null) return cachedReadRoots;
+  const warn = (message: string) => console.error(`omp-delegate: ${message}`);
   let values: unknown;
   try {
     values = JSON.parse(process.env.OMP_DELEGATE_READ_PATHS ?? "[]");
   } catch {
-    return [workspace];
+    warn("read grants ignored: OMP_DELEGATE_READ_PATHS is not valid JSON; only the workspace is admitted");
+    return (cachedReadRoots = [workspace]);
   }
   if (!Array.isArray(values) || !values.every((value) => typeof value === "string" && isAbsolute(value))) {
-    return [workspace];
+    warn("read grants ignored: OMP_DELEGATE_READ_PATHS is not an array of absolute paths; only the workspace is admitted");
+    return (cachedReadRoots = [workspace]);
   }
   const roots = [workspace];
   for (const value of values) {
     const resolved = resolve(value);
     try {
       const metadata = lstatSync(resolved);
-      if (
-        value !== resolved
-        || metadata.isSymbolicLink()
-        || (!metadata.isFile() && !metadata.isDirectory())
-        || realpathSync(resolved) !== resolved
-      ) {
-        continue;
+      if (value !== resolved) {
+        warn(`dropped read root ${value}: not in canonical form (resolves to ${resolved})`);
+      } else if (metadata.isSymbolicLink()) {
+        warn(`dropped read root ${value}: is a symlink`);
+      } else if (!metadata.isFile() && !metadata.isDirectory()) {
+        warn(`dropped read root ${value}: not a regular file or directory`);
+      } else if (realpathSync(resolved) !== resolved) {
+        warn(`dropped read root ${value}: a path component is a symlink`);
+      } else {
+        roots.push(resolved);
       }
-      roots.push(resolved);
     } catch {
-      continue;
+      warn(`dropped read root ${value}: not lstat-able by uid ${process.getuid?.() ?? "?"} (missing, or a path component denies traverse)`);
     }
   }
-  return roots;
+  return (cachedReadRoots = roots);
 }
 
 function configuredWritePatterns(): RegExp[] {

@@ -23,7 +23,9 @@ class ExtensionTest(unittest.TestCase):
         existing_paths: list[str] | None = None,
         hookless_commit: bool = False,
         structured_result: bool = False,
-    ) -> list[object]:
+        read_paths: list[str] | None = None,
+        want_stderr: bool = False,
+    ) -> list[object] | tuple[list[object], str]:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             workspace = root / "workspace"
@@ -53,7 +55,7 @@ console.log(JSON.stringify(output));''')
                 **os.environ,
                 "OMP_DELEGATE_FINAL_PATH": str(final),
                 "OMP_DELEGATE_SANDBOX": sandbox,
-                "OMP_DELEGATE_READ_PATHS": "[]",
+                "OMP_DELEGATE_READ_PATHS": json.dumps(read_paths or []),
                 "OMP_DELEGATE_WRITE_PATTERNS": json.dumps(write_patterns or []),
                 "OMP_DELEGATE_GIT_MODE": git_mode,
                 "OMP_DELEGATE_CREATE_ONLY": "1" if create_only else "0",
@@ -63,7 +65,8 @@ console.log(JSON.stringify(output));''')
             }
             result = subprocess.run(["node", str(runner)], env=env, text=True, capture_output=True, check=False)
         self.assertEqual(0, result.returncode, result.stderr)
-        return json.loads(result.stdout)
+        parsed = json.loads(result.stdout)
+        return (parsed, result.stderr) if want_stderr else parsed
 
     def sandbox_argv(
         self,
@@ -86,6 +89,71 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
                 capture_output=True, check=False)
         self.assertEqual(0, result.returncode, result.stderr)
         return json.loads(result.stdout)
+
+    def test_dropped_read_roots_are_loud(self) -> None:
+        """A granted read root the worker cannot use must be REFUSED LOUDLY on
+        stderr, not silently narrowed to the workspace. The silent drop once
+        hid a dead evidence grant for weeks: a caller policy granted a 0700
+        directory owned by another uid, the worker could not lstat it, and the
+        delegate produced its report from memory instead of the granted inputs.
+        """
+        with tempfile.TemporaryDirectory() as outside:
+            missing = os.path.join(outside, "never-created")
+            linked = os.path.join(outside, "link")
+            os.symlink(outside, linked)
+            results, stderr = self.exercise(
+                [{"toolName": "read", "input": {"path": missing}}],
+                read_paths=[missing, linked],
+                want_stderr=True,
+            )
+        self.assertTrue(results[0]["block"])
+        self.assertIn(f"dropped read root {missing}", stderr)
+        self.assertIn("not lstat-able", stderr)
+        self.assertIn(f"dropped read root {linked}", stderr)
+        self.assertIn("symlink", stderr)
+
+    def test_healthy_read_roots_stay_quiet_and_admitted(self) -> None:
+        with tempfile.TemporaryDirectory() as outside:
+            granted = os.path.realpath(outside)
+            inside = os.path.join(granted, "data.txt")
+            Path(inside).write_text("evidence")
+            results, stderr = self.exercise(
+                [{"toolName": "read", "input": {"path": inside}}],
+                read_paths=[granted],
+                want_stderr=True,
+            )
+        self.assertIsNone(results[0])
+        self.assertNotIn("dropped read root", stderr)
+
+    def test_unparseable_read_grant_env_is_loud(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            final = root / "final.json"
+            runner = root / "runner.ts"
+            runner.write_text(f'''import extension from {json.dumps(EXTENSION.as_uri())};
+const handlers = new Map<string, Function>();
+const scalar = {{ optional() {{ return this; }}, describe() {{ return this; }} }};
+const pi = {{ zod: {{ string: () => scalar, number: () => scalar, array: (_v: unknown) => scalar, enum: (_v: unknown) => scalar, object: (_v: unknown) => scalar }}, on: (n: string, h: Function) => handlers.set(n,h), registerTool: () => undefined }};
+extension(pi);
+console.log(JSON.stringify(await handlers.get("tool_call")!({{toolName: "read", input: {{path: "inside.txt"}}}}, {{cwd:{json.dumps(str(workspace))}}}) ?? null));''')
+            env = {
+                **os.environ,
+                "OMP_DELEGATE_FINAL_PATH": str(final),
+                "OMP_DELEGATE_SANDBOX": "workspace-write",
+                "OMP_DELEGATE_READ_PATHS": "not json",
+                "OMP_DELEGATE_WRITE_PATTERNS": "[]",
+                "OMP_DELEGATE_GIT_MODE": "none",
+                "OMP_DELEGATE_CREATE_ONLY": "0",
+                "OMP_DELEGATE_CALLER": "",
+                "OMP_DELEGATE_HOOKLESS_COMMIT": "0",
+                "OMP_DELEGATE_STRUCTURED_RESULT": "0",
+            }
+            result = subprocess.run(["node", str(runner)], env=env, text=True, capture_output=True, check=False)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIsNone(json.loads(result.stdout))
+        self.assertIn("read grants ignored", result.stderr)
 
     def test_workspace_paths_pass_and_escapes_fail(self) -> None:
         results = self.exercise([
