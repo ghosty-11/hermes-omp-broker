@@ -1,6 +1,6 @@
 ---
 name: hermes-omp-delegation
-description: Delegate a bounded repository implementation or review task from Hermes to OMP through the typed broker. Use when the caller lacks the required coding surface or an isolated OMP workflow is selected; not for ordinary advice, explanation, task tracking, mailbox messages, publication, or host administration.
+description: Use when delegating a bounded repo implementation or review from Hermes to OMP. Not for ordinary advice, task tracking, mailbox messages, publication, or host administration.
 ---
 
 # Hermes to OMP Delegation
