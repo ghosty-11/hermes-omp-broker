@@ -49,10 +49,14 @@ FRAME_TIMEOUT = 5.0
 JOB_STORE = JobStore(Path(os.environ.get("HERMES_OMP_JOB_DIR", "state/jobs")))
 
 
+# Inside the state directory the unit admits writes to through its
+# ReadWritePaths entry. This service runs ProtectHome=read-only with
+# ProtectSystem=strict, so the natural "state root" spot one level up answers
+# EROFS and the stamp is never written at all (measured 2026-09-12).
 BROKER_POLICY_STAMP = Path(os.environ.get(
     "HERMES_OMP_POLICY_STAMP",
     str(Path(os.environ.get(
-        "HERMES_OMP_AGENT_DIR", "state/agent")).parent / "broker-policy.json"),
+        "HERMES_OMP_AGENT_DIR", "state/agent")) / "broker-policy.json"),
 ))
 
 
