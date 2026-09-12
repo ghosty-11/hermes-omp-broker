@@ -15,6 +15,10 @@ TERMINAL = {"completed", "failed", "rejected", "cancelled", "timed_out", "orphan
 
 LEASE_UNAVAILABLE = "job unavailable"
 
+# A consumed lease's status window is bounded by its own timeout; past this age
+# the tombstoned issued record is only scan ballast for issue().
+TOMBSTONE_RETIREMENT_AGE = 24 * 60 * 60
+
 
 class LeaseUnavailable(RuntimeError):
     pass
@@ -318,9 +322,8 @@ class LeaseStore:
             os.close(fd)
 
     def _read_tombstone(
-        self, lease_id: str, issued_record: dict[str, Any],
+        self, path: Path, issued_record: dict[str, Any],
     ) -> dict[str, Any]:
-        path = self._consumed_path(lease_id)
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         try:
             self._validate_inode(
@@ -362,10 +365,37 @@ class LeaseStore:
             record = self._read_bound(
                 lease_id, endpoint=endpoint, peer_uid=peer_uid)
             try:
-                self._read_tombstone(lease_id, record)
+                self._read_tombstone(self._consumed_path(lease_id), record)
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
                 raise LeaseUnavailable(LEASE_UNAVAILABLE) from None
             return dict(record["fixed_request"])
+
+    def retire_consumed(self) -> int:
+        """Retire issued records proven consumed by a matching, over-age tombstone."""
+        retired = 0
+        with self._locked():
+            for candidate in list(self.issued.glob("*.json")):
+                try:
+                    record = self._read_issued_path(candidate)
+                except (OSError, KeyError, TypeError, ValueError):
+                    # A corrupt record must survive to keep failing issue() closed.
+                    continue
+                try:
+                    tombstone = self._read_tombstone(
+                        self.consumed / f"{candidate.stem}.json", record)
+                except (LeaseUnavailable, OSError, KeyError, TypeError, ValueError):
+                    # Anything short of a valid matching tombstone proves nothing.
+                    continue
+                consumed_at = tombstone.get("consumed_at")
+                if (
+                    isinstance(consumed_at, bool)
+                    or not isinstance(consumed_at, int)
+                    or consumed_at > int(time.time()) - TOMBSTONE_RETIREMENT_AGE
+                ):
+                    continue
+                os.unlink(candidate)
+                retired += 1
+        return retired
 
 
 class JobStore:

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from broker.lifecycle import JobStore
+from broker.lifecycle import JobStore, LeaseStore, TOMBSTONE_RETIREMENT_AGE
 
 
 class LifecycleTest(unittest.TestCase):
@@ -48,6 +51,113 @@ class LifecycleTest(unittest.TestCase):
         record = self.store.get("req")
         self.assertEqual("delivery_failed", record["status"])
         self.assertEqual(response, record["result"])
+
+
+class LeaseRetirementTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "issued").mkdir(mode=0o750)
+        (self.root / "consumed").mkdir(mode=0o700)
+        lock_fd = os.open(
+            self.root / ".lease-store.lock", os.O_RDWR | os.O_CREAT, 0o660)
+        os.fchmod(lock_fd, 0o660)
+        os.close(lock_fd)
+        self.store = LeaseStore(
+            self.root,
+            issuer_uid=os.geteuid(),
+            issuer_gid=os.getegid(),
+            broker_uid=os.geteuid(),
+            broker_gid=os.getegid(),
+        )
+
+    def _issue(self, *, request_id: str = "request-1", task_id: str = "task-1",
+               expires_at: int | None = None) -> str:
+        return self.store.issue(
+            fixed_request={
+                "request_id": request_id,
+                "task_id": task_id,
+                "repository": "repo",
+                "caller": "audit",
+                "workspace": str(self.root / "workspace"),
+                "sandbox": "restricted-write",
+                "model": "provider/fixed",
+                "prompt": "fixed prompt",
+                "timeout": 30,
+            },
+            endpoint="audit",
+            peer_uid=997,
+            artifact_digest="sha256:artifact",
+            policy_version="policy-v1",
+            template_version="template-v1",
+            expires_at=expires_at or int(time.time()) + 3600,
+        )
+
+    def _backdate_tombstone(self, lease_id: str, *, seconds: int) -> None:
+        path = self.store._consumed_path(lease_id)
+        tombstone = json.loads(path.read_text())
+        tombstone["consumed_at"] -= seconds
+        tombstone["record_digest"] = self.store._tombstone_digest(tombstone)
+        path.write_text(
+            json.dumps(tombstone, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def _rewrite_issued(self, lease_id: str, **changes) -> None:
+        path = self.store._path(lease_id)
+        record = json.loads(path.read_text())
+        record.update(changes)
+        record["record_digest"] = self.store._record_digest(record)
+        path.write_text(
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def test_tombstone_past_retirement_age_frees_the_identity_for_reissue(self) -> None:
+        lease_id = self._issue()
+        self.store.consume(lease_id, endpoint="audit", peer_uid=997)
+        self._backdate_tombstone(lease_id, seconds=TOMBSTONE_RETIREMENT_AGE + 1)
+        self.assertEqual(1, self.store.retire_consumed())
+        reissued = self._issue()
+        self.assertNotEqual(lease_id, reissued)
+        self.assertFalse(self.store._path(lease_id).exists())
+        # The tombstone is the durable proof of consumption; only the issued
+        # record leaves issue()'s scan.
+        self.assertTrue(self.store._consumed_path(lease_id).exists())
+        self.assertEqual(1, len(list(self.store.issued.glob("*.json"))))
+
+    def test_recent_tombstone_keeps_the_record_and_the_refusal(self) -> None:
+        lease_id = self._issue()
+        self.store.consume(lease_id, endpoint="audit", peer_uid=997)
+        self.store.retire_consumed()
+        with self.assertRaises(ValueError) as raised:
+            self._issue()
+        self.assertEqual(
+            "task or request already has a lease", str(raised.exception))
+        self.assertTrue(self.store._path(lease_id).exists())
+
+    def test_unconsumed_identity_is_never_retired_even_when_dead(self) -> None:
+        lease_id = self._issue(expires_at=int(time.time()) + 60)
+        self._rewrite_issued(
+            lease_id,
+            issued_at=int(time.time()) - 10 * TOMBSTONE_RETIREMENT_AGE,
+            expires_at=int(time.time()) - 1,
+        )
+        self.store.retire_consumed()
+        with self.assertRaises(ValueError) as raised:
+            self._issue()
+        self.assertEqual(
+            "task or request already has a lease", str(raised.exception))
+        self.assertTrue(self.store._path(lease_id).exists())
+
+    def test_a_tombstone_that_fails_validation_proves_nothing(self) -> None:
+        lease_id = self._issue()
+        self.store.consume(lease_id, endpoint="audit", peer_uid=997)
+        self._backdate_tombstone(lease_id, seconds=TOMBSTONE_RETIREMENT_AGE + 1)
+        self.store._consumed_path(lease_id).write_text("{}\n")
+        self.store.retire_consumed()
+        with self.assertRaises(ValueError) as raised:
+            self._issue()
+        self.assertEqual(
+            "task or request already has a lease", str(raised.exception))
+        self.assertTrue(self.store._path(lease_id).exists())
 
 
 if __name__ == "__main__":
