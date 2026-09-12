@@ -56,11 +56,18 @@ redeem, or read lease, job, policy, template, credential, or audit state.
 Each endpoint store separates immutable `issued/` records from broker-owned `consumed/`
 tombstones. An issued record contains the complete fixed request, endpoint, peer UID, task
 ID, request ID, prompt digest, artifact digest, policy version, template version, issue time,
-and expiry. The broker atomically creates the consumed tombstone with `O_EXCL` before
-credential resolution, job creation, audit output, or child-process creation; it never
-rewrites the issued record. A torn tombstone remains a replay denial. Completion, failure,
-timeout, disconnect, delivery failure, and broker restart do not make the capability
-reusable. Status joins the immutable issued record with its valid consumed tombstone.
+and expiry. The broker validates the redeemed request against policy before it
+atomically creates the consumed tombstone with `O_EXCL`, and the tombstone still
+precedes credential resolution, job creation, audit output, or child-process
+creation; the broker never rewrites the issued record, so a policy rejection
+leaves the lease unconsumed. A torn tombstone remains a replay denial.
+Completion, failure, timeout, disconnect, and delivery failure do not make the
+capability reusable. A restart or fault that leaves the job without a result row
+admits exactly one re-execution of the spent lease — tracked by a `reexecuted`
+flag in the job record — and only when the caller's pinned model and every
+fallback rung are absent from the policy's optional top-level `metered_models`
+list; a missing or malformed list refuses re-execution everywhere. Status joins
+the immutable issued record with its valid consumed tombstone.
 
 Protocol v2 health is a no-spend live canary. The launcher sends exactly
 `{"version":2,"op":"health"}` through its mapped endpoint. The broker verifies the endpoint

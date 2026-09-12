@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import pwd
+import socket
 import sys
 import stat
 import subprocess
@@ -498,11 +499,11 @@ class BrokerPolicyTest(unittest.TestCase):
 
 
 class ProtocolV2LeaseTest(unittest.TestCase):
-    def _load(self, root: Path):
+    def _load(self, root: Path, *, metered_models: tuple[str, ...] | None = ()):
         policy = root / "policy.json"
         workspace = root / "repo"
         workspace.mkdir(parents=True, exist_ok=True)
-        policy.write_text(json.dumps({
+        document = {
             "version": 1,
             "repositories": {"repo": {"path": str(workspace)}},
             "callers": {"audit": {
@@ -515,7 +516,10 @@ class ProtocolV2LeaseTest(unittest.TestCase):
                 "model": "provider/fixed",
                 "max_timeout": 60,
             }},
-        }))
+        }
+        if metered_models is not None:
+            document["metered_models"] = list(metered_models)
+        policy.write_text(json.dumps(document))
         for endpoint in ("audit", "planner", "code"):
             store_root = root / "leases" / endpoint
             (store_root / "issued").mkdir(
@@ -970,6 +974,133 @@ class ProtocolV2LeaseTest(unittest.TestCase):
                         {"version": 2, "op": "status", "lease_id": lease_id},
                         endpoint=endpoint, peer_uid=uid)
                 self.assertEqual("job unavailable", str(raised.exception))
+
+    def test_policy_disagreement_leaves_the_lease_unconsumed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            module = self._load(Path(td))
+            store = module.LEASE_STORES["audit"]
+            lease_id = self._issue(
+                module, Path(td), fixed={"model": "provider/other"})
+            issued_before = store._path(lease_id).read_bytes()
+            with self.assertRaises(module.ProtocolError) as raised:
+                module.parse_request(
+                    {"version": 2, "op": "execute", "lease_id": lease_id},
+                    endpoint="audit", peer_uid=997)
+            self.assertEqual("job unavailable", str(raised.exception))
+            self.assertEqual([], list(store.consumed.glob("*.json")))
+            self.assertEqual(issued_before, store._path(lease_id).read_bytes())
+            # The identity is not burned: once policy agrees, the same
+            # lease still executes instead of being spent on the rejection.
+            module.CALLER_POLICIES["audit"]["model"] = "provider/other"
+            request = module.parse_request(
+                {"version": 2, "op": "execute", "lease_id": lease_id},
+                endpoint="audit", peer_uid=997)
+            self.assertEqual("request-1", request.request_id)
+            self.assertEqual(1, len(list(store.consumed.glob("*.json"))))
+
+    def test_consumed_lease_without_result_row_reexecutes_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            for shape in ("pending", "orphaned"):
+                with self.subTest(shape=shape):
+                    module = self._load(Path(td) / shape)
+                    store = module.LEASE_STORES["audit"]
+                    lease_id = self._issue(module, Path(td) / shape)
+                    execute = {"version": 2, "op": "execute", "lease_id": lease_id}
+                    # Attempt 1 spends the lease and dies before any result row.
+                    module.parse_request(execute, endpoint="audit", peer_uid=997)
+                    module.JOB_STORE.create(
+                        "request-1", task_id="task-1", repository="repo",
+                        caller="audit")
+                    if shape == "orphaned":
+                        module.JOB_STORE.recover_orphans()
+                    self.assertIsNone(module.JOB_STORE.get("request-1")["result"])
+                    final = {
+                        "summary": "The re-executed run finished.",
+                        "verification": ["re-execution verified"],
+                        "gaps": [],
+                        "verdict": "MET",
+                    }
+
+                    def fake_start(_request, final_path, _keys):
+                        Path(final_path).write_text(json.dumps(final))
+                        process = mock.Mock()
+                        process.pid = 4242
+                        process.returncode = 0
+                        process.communicate.return_value = (b"", b"")
+                        return process
+
+                    conn = socket.socketpair()
+
+                    with mock.patch.object(module, "record_audit"), \
+                            mock.patch.object(
+                                module, "_process_group_exists",
+                                return_value=False), \
+                            mock.patch.object(
+                                module, "acquire_workspace_lock",
+                                return_value=mock.Mock()), \
+                            mock.patch.object(
+                                module, "resolve_provider_api_keys",
+                                return_value={}), \
+                            mock.patch.object(
+                                module, "start_omp_process",
+                                side_effect=fake_start):
+                        # Attempt 2: the spent lease re-executes once.
+                        request = module.parse_request(
+                            execute, endpoint="audit", peer_uid=997)
+                        response = module.run_request(request, conn[1])
+                    self.assertEqual(2, response["version"])
+                    record = module.JOB_STORE.get("request-1")
+                    self.assertTrue(record["reexecuted"])
+                    self.assertEqual("completed", record["status"])
+                    self.assertIsNotNone(record["result"])
+                    # Attempt 3 reports unavailable instead of re-running.
+                    with self.assertRaises(module.ProtocolError) as raised:
+                        module.parse_request(execute, endpoint="audit", peer_uid=997)
+                    self.assertEqual("job unavailable", str(raised.exception))
+                    self.assertEqual(1, len(list(store.consumed.glob("*.json"))))
+
+    def test_metered_or_unknown_lanes_refuse_reexecution(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            for name, metered, rungs in (
+                ("unknown", None, ()),
+                ("pinned-model", ("provider/fixed",), ()),
+                ("fallback-rung", ("provider/cheap",), ("provider/cheap",)),
+            ):
+                with self.subTest(name=name):
+                    root = Path(td) / name
+                    module = self._load(root, metered_models=metered)
+                    if rungs:
+                        module.CALLER_POLICIES["audit"]["fallback_models"] = (
+                            list(rungs))
+                    store = module.LEASE_STORES["audit"]
+                    lease_id = self._issue(module, root)
+                    execute = {"version": 2, "op": "execute", "lease_id": lease_id}
+                    module.parse_request(execute, endpoint="audit", peer_uid=997)
+                    module.JOB_STORE.create(
+                        "request-1", task_id="task-1", repository="repo",
+                        caller="audit")
+                    with self.assertRaises(module.ProtocolError) as raised:
+                        module.parse_request(execute, endpoint="audit", peer_uid=997)
+                    self.assertEqual("job unavailable", str(raised.exception))
+                    record = module.JOB_STORE.get("request-1")
+                    self.assertNotIn("reexecuted", record)
+                    self.assertEqual("pending", record["status"])
+                    self.assertEqual(1, len(list(store.consumed.glob("*.json"))))
+
+    def test_happy_path_consumes_the_lease_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            module = self._load(Path(td))
+            store = module.LEASE_STORES["audit"]
+            lease_id = self._issue(module, Path(td))
+            execute = {"version": 2, "op": "execute", "lease_id": lease_id}
+            request = module.parse_request(execute, endpoint="audit", peer_uid=997)
+            self.assertEqual("request-1", request.request_id)
+            self.assertEqual(2, request.protocol_version)
+            self.assertEqual(1, len(list(store.consumed.glob("*.json"))))
+            with self.assertRaises(module.ProtocolError) as raised:
+                module.parse_request(execute, endpoint="audit", peer_uid=997)
+            self.assertEqual("job unavailable", str(raised.exception))
+            self.assertEqual(1, len(list(store.consumed.glob("*.json"))))
 
 
 if __name__ == "__main__":

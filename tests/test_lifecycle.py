@@ -52,6 +52,36 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual("delivery_failed", record["status"])
         self.assertEqual(response, record["result"])
 
+    def test_arm_reexecution_rearms_an_orphaned_result_less_record_once(self) -> None:
+        self.store.create("req", task_id="task-1", repository="repo", caller="caller")
+        self.store.recover_orphans()
+        self.assertEqual("orphaned", self.store.get("req")["status"])
+        self.store.arm_reexecution(
+            "req", task_id="task-1", repository="repo", caller="caller")
+        record = self.store.get("req")
+        self.assertTrue(record["reexecuted"])
+        self.assertEqual("pending", record["status"])
+        self.assertIsNone(record["result"])
+
+    def test_arm_reexecution_refuses_spent_answered_and_foreign_records(self) -> None:
+        self.store.create("req", task_id="task-1", repository="repo", caller="caller")
+        self.store.arm_reexecution(
+            "req", task_id="task-1", repository="repo", caller="caller")
+        with self.assertRaises(ValueError):
+            self.store.arm_reexecution(
+                "req", task_id="task-1", repository="repo", caller="caller")
+        self.store.finish("req", "completed", {"request_id": "req"})
+        with self.assertRaises(ValueError):
+            self.store.arm_reexecution(
+                "req", task_id="task-1", repository="repo", caller="caller")
+        self.store.create("other", task_id="task-2", repository="repo", caller="caller")
+        with self.assertRaises(ValueError):
+            self.store.arm_reexecution(
+                "other", task_id="task-9", repository="repo", caller="caller")
+        with self.assertRaises(OSError):
+            self.store.arm_reexecution(
+                "missing", task_id="task-2", repository="repo", caller="caller")
+
 
 class LeaseRetirementTest(unittest.TestCase):
     def setUp(self) -> None:

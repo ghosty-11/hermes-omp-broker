@@ -344,6 +344,14 @@ class LeaseStore:
             raise LeaseUnavailable(LEASE_UNAVAILABLE)
         return record
 
+    def peek(self, lease_id: str, *, endpoint: str, peer_uid: int) -> dict[str, Any]:
+        """The bound fixed request, read without consuming: policy validation
+        runs on it before the identity is spent."""
+        with self._locked():
+            record = self._read_bound(
+                lease_id, endpoint=endpoint, peer_uid=peer_uid)
+            return dict(record["fixed_request"])
+
     def consume(self, lease_id: str, *, endpoint: str, peer_uid: int) -> dict[str, Any]:
         """Create the durable tombstone before any credential or job side effect."""
         with self._locked():
@@ -441,6 +449,25 @@ class JobStore:
             raise ValueError("request identifier already exists")
         now = int(time.time())
         self._write({"version": 1, "request_id": request_id, "task_id": task_id, "repository": repository, "caller": caller, "status": "pending", "process_group": None, "result": None, "created_at": now, "updated_at": now})
+
+    def arm_reexecution(
+        self, request_id: str, *, task_id: str, repository: str, caller: str,
+    ) -> None:
+        """Admit the job's single re-execution: a result-less record is
+        re-armed and marked; a spent, answered, or foreign record is refused."""
+        record = self.get(request_id)
+        if (
+            record.get("reexecuted")
+            or record.get("result") is not None
+            or record.get("task_id") != task_id
+            or record.get("repository") != repository
+            or record.get("caller") != caller
+        ):
+            raise ValueError("job record does not admit re-execution")
+        record.update(
+            status="pending", process_group=None, reexecuted=True,
+            updated_at=int(time.time()))
+        self._write(record)
 
     def _transition(self, request_id: str, status: str, *, process_group: int | None = None, result: dict[str, Any] | None = None) -> None:
         record = self.get(request_id)

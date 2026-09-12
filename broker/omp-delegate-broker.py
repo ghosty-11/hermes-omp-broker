@@ -211,6 +211,7 @@ def _load_policy() -> tuple[
     dict[str, str],
     dict[str, Path],
     dict[str, dict[str, object]],
+    frozenset[str] | None,
 ]:
     try:
         value = json.loads(POLICY_FILE.read_text())
@@ -249,12 +250,17 @@ def _load_policy() -> tuple[
                     if item in repository_paths
                 }
                 sandboxes[name] = sandbox
-        return workspaces, sandboxes, repository_paths, callers
+        raw_metered = value.get("metered_models")
+        metered_models: frozenset[str] | None = None
+        if isinstance(raw_metered, list) and all(
+                isinstance(item, str) for item in raw_metered):
+            metered_models = frozenset(raw_metered)
+        return workspaces, sandboxes, repository_paths, callers, metered_models
     except (OSError, ValueError, TypeError):
-        return {}, {}, {}, {}
+        return {}, {}, {}, {}, None
 
 
-ALLOWED_WORKSPACES, ALLOWED_SANDBOXES, REPOSITORY_PATHS, CALLER_POLICIES = _load_policy()
+ALLOWED_WORKSPACES, ALLOWED_SANDBOXES, REPOSITORY_PATHS, CALLER_POLICIES, METERED_MODELS = _load_policy()
 REQUEST_FIELDS = {"version", "request_id", "task_id", "repository", "caller", "workspace", "sandbox", "model", "prompt", "timeout"}
 STATUS_REQUEST_FIELDS = {"version", "op", "request_id", "caller", "repository"}
 V2_REQUEST_FIELDS = {"version", "op", "lease_id"}
@@ -332,6 +338,7 @@ class Request:
     fallback_models: tuple[str, ...] | None = None
     fallback_selectors: tuple[str, ...] = ()
     protocol_version: int = 1
+    reexecuted: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -507,6 +514,40 @@ def validate_status_request(value: object, *, peer_uid: int) -> StatusRequest:
     return StatusRequest(value["request_id"], value["caller"], value["repository"])
 
 
+def _lane_is_metered(request: Request) -> bool:
+    """True unless policy proves the caller's pinned model and every fallback
+    rung unmetered: an absent or malformed metered_models list refuses
+    re-execution everywhere, because an unknown lane may spend real money."""
+    if METERED_MODELS is None:
+        return True
+    chain = (request.model, *fallback_models(request))
+    return any(model in METERED_MODELS for model in chain)
+
+
+def _arm_resultless_reexecution(
+    store: LeaseStore, lease_id: str, request: Request, *,
+    endpoint: str, peer_uid: int,
+) -> None:
+    """consume() refused a spent identity: re-arm the job's single
+    re-execution when its record holds no result row and the caller's lane
+    is unmetered; every other shape keeps reporting unavailable."""
+    if _lane_is_metered(request):
+        print("omp-delegate-broker: v2 execute re-execution denied: "
+              f"metered or unproven lane {request.model!r}", file=sys.stderr)
+        raise ProtocolError(
+            "job unavailable", version=2, operation="execute") from None
+    try:
+        fixed = store.resolve(lease_id, endpoint=endpoint, peer_uid=peer_uid)
+        JOB_STORE.arm_reexecution(
+            str(fixed["request_id"]), task_id=str(fixed["task_id"]),
+            repository=str(fixed["repository"]), caller=str(fixed["caller"]))
+    except (LeaseUnavailable, OSError, ValueError) as exc:
+        print(f"omp-delegate-broker: v2 execute re-execution denied: {exc!r}",
+              file=sys.stderr)
+        raise ProtocolError(
+            "job unavailable", version=2, operation="execute") from None
+
+
 def parse_request(
     value: object, *, peer_uid: int, endpoint: str | None = None,
 ) -> Request | StatusRequest | HealthRequest:
@@ -540,10 +581,24 @@ def parse_request(
         store = LEASE_STORES[endpoint]
         try:
             if operation == "execute":
-                fixed = store.consume(
-                    value["lease_id"], endpoint=endpoint, peer_uid=peer_uid)
                 request = validate_request(
-                    {"version": 1, **fixed}, peer_uid=None)
+                    {"version": 1,
+                     **store.peek(
+                         value["lease_id"], endpoint=endpoint, peer_uid=peer_uid)},
+                    peer_uid=None)
+                try:
+                    store.consume(
+                        value["lease_id"], endpoint=endpoint, peer_uid=peer_uid)
+                except LeaseUnavailable:
+                    # B3 (2026-09-12): the identity is spent. Re-admit the job
+                    # exactly once when its record holds no result row and the
+                    # caller's lane is unmetered; every other shape stays
+                    # unavailable instead of looping the authority.
+                    _arm_resultless_reexecution(
+                        store, value["lease_id"], request,
+                        endpoint=endpoint, peer_uid=peer_uid)
+                    return dataclasses.replace(
+                        request, protocol_version=2, reexecuted=True)
                 return dataclasses.replace(request, protocol_version=2)
             fixed = store.resolve(
                 value["lease_id"], endpoint=endpoint, peer_uid=peer_uid)
@@ -1129,12 +1184,15 @@ def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
     EROFS escaped the inner handlers and froze two production jobs at
     pending with no audit row while the client saw only a masked error."""
     request_id = request.request_id
-    JOB_STORE.create(
-        request_id,
-        task_id=request.task_id,
-        repository=request.repository,
-        caller=request.caller,
-    )
+    if not request.reexecuted:
+        # A re-execution reuses the record parse_request re-armed; create
+        # would refuse the already-existing identifier.
+        JOB_STORE.create(
+            request_id,
+            task_id=request.task_id,
+            repository=request.repository,
+            caller=request.caller,
+        )
     try:
         return _run_request_inner(request, conn)
     except Exception as exc:  # noqa: BLE001 — deliberate last-resort boundary
