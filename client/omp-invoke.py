@@ -42,6 +42,19 @@ class InvocationError(RuntimeError):
     pass
 
 
+class JobUnavailableError(InvocationError):
+    code = "job-unavailable"
+
+
+class ExecutionRejectedError(InvocationError):
+    code = "execution-rejected"
+
+
+class ResponseTooLargeError(InvocationError):
+    code = "response-too-large"
+
+
+
 @dataclasses.dataclass(frozen=True)
 class Policy:
     request_id: str
@@ -365,9 +378,30 @@ def _valid_final(value: object) -> bool:
 def validate_response(
     value: object, *, version: int = 1,
 ) -> dict[str, object]:
+    if (
+        version == 2
+        and isinstance(value, dict)
+        and set(value) == {"version", "op", "ok", "error"}
+    ):
+        if value.get("version") != 2 or value.get("ok") is not False:
+            raise InvocationError("broker returned an invalid error response contract")
+        operation = value.get("op")
+        error = value.get("error")
+        if operation not in {"execute", "status"} or not isinstance(error, str):
+            raise InvocationError("broker returned an invalid error response contract")
+        if operation == "execute" and error == "job unavailable":
+            raise ExecutionRejectedError("broker refused execution")
+        if error == "response exceeded size bound":
+            raise ResponseTooLargeError("broker response exceeded size bound")
+        if operation == "status" and error == "job unavailable":
+            raise JobUnavailableError("job unavailable")
+        raise InvocationError("broker returned an invalid error response contract")
     if not isinstance(value, dict) or set(value) != RESPONSE_FIELDS or value.get("version") != version:
         raise InvocationError("broker returned an invalid response contract")
-    if not isinstance(value.get("exit_code"), int):
+    if (
+        not isinstance(value.get("exit_code"), int)
+        or isinstance(value.get("exit_code"), bool)
+    ):
         raise InvocationError("broker returned an invalid exit code")
     if not all(isinstance(value.get(name), str) for name in ("stdout", "stderr", "request_id")):
         raise InvocationError("broker returned invalid text fields")
@@ -548,6 +582,12 @@ def invoke_broker_v2(
             response = json.loads(_recv_exact(conn, size))
     except (OSError, json.JSONDecodeError, struct.error) as exc:
         raise InvocationError(f"OMP broker request failed: {exc}") from exc
+    if (
+        isinstance(response, dict)
+        and set(response) == {"version", "op", "ok", "error"}
+        and response.get("op") != op
+    ):
+        raise InvocationError("broker returned an invalid error response contract")
     if op == "execute":
         return validate_response(response, version=2)
     if (
@@ -557,9 +597,14 @@ def invoke_broker_v2(
     ):
         raise InvocationError("broker returned an invalid status response contract")
     if set(response) == STATUS_ERROR_FIELDS:
-        if response.get("ok") is False and response.get("error") == "job unavailable":
-            raise InvocationError("job unavailable")
-        raise InvocationError("broker returned an invalid status response contract")
+        if response.get("ok") is not False:
+            raise InvocationError("broker returned an invalid status response contract")
+        error = response.get("error")
+        if error == "response exceeded size bound":
+            raise ResponseTooLargeError("broker response exceeded size bound")
+        if error != "job unavailable":
+            raise InvocationError("broker returned an invalid status response contract")
+        raise JobUnavailableError("job unavailable")
     if set(response) != STATUS_SUCCESS_FIELDS or response.get("ok") is not True:
         raise InvocationError("broker returned an invalid status response contract")
     job = response.get("job")

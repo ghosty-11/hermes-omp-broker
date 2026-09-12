@@ -81,6 +81,32 @@ class LifecycleTest(unittest.TestCase):
         with self.assertRaises(OSError):
             self.store.arm_reexecution(
                 "missing", task_id="task-2", repository="repo", caller="caller")
+    def test_reexecution_mark_survives_new_store_instance(self) -> None:
+        self.store.create("req", task_id="task", repository="repo", caller="caller")
+        self.store.recover_orphans()
+        self.store.arm_reexecution(
+            "req", task_id="task", repository="repo", caller="caller")
+        restarted = JobStore(Path(self.temp.name))
+        with self.assertRaises(ValueError):
+            restarted.arm_reexecution(
+                "req", task_id="task", repository="repo", caller="caller")
+        self.assertTrue(restarted.get("req")["reexecuted"])
+
+    def test_reexecution_rejects_live_cancelled_failed_and_missing_records(self) -> None:
+        self.store.create("live", task_id="task", repository="repo", caller="caller")
+        self.store.running("live", process_group=123)
+        self.store.create("cancelled", task_id="task", repository="repo", caller="caller")
+        self.store._transition("cancelled", "cancelled")
+        self.store.create("failed", task_id="task", repository="repo", caller="caller")
+        self.store.finish("failed", "failed", {})
+        for request_id in ("live", "cancelled", "failed"):
+            with self.subTest(request_id=request_id):
+                with self.assertRaises(ValueError):
+                    self.store.arm_reexecution(
+                        request_id, task_id="task", repository="repo", caller="caller")
+        with self.assertRaises(OSError):
+            self.store.arm_reexecution(
+                "missing", task_id="task", repository="repo", caller="caller")
 
 
 class LeaseRetirementTest(unittest.TestCase):
@@ -188,6 +214,17 @@ class LeaseRetirementTest(unittest.TestCase):
         self.assertEqual(
             "task or request already has a lease", str(raised.exception))
         self.assertTrue(self.store._path(lease_id).exists())
+    def test_protected_request_id_survives_proven_consumed_retirement(self) -> None:
+        lease_id = self._issue(request_id="request-1")
+        protected_id = self._issue(request_id="request-2", task_id="task-2")
+        self.store.consume(lease_id, endpoint="audit", peer_uid=997)
+        self.store.consume(protected_id, endpoint="audit", peer_uid=997)
+        self._backdate_tombstone(lease_id, seconds=TOMBSTONE_RETIREMENT_AGE + 1)
+        self._backdate_tombstone(protected_id, seconds=TOMBSTONE_RETIREMENT_AGE + 1)
+        self.assertEqual(
+            1, self.store.retire_consumed(protected_request_ids=("request-2",)))
+        self.assertFalse(self.store._path(lease_id).exists())
+        self.assertTrue(self.store._path(protected_id).exists())
 
 
 if __name__ == "__main__":

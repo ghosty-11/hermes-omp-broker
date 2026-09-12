@@ -99,6 +99,48 @@ class PolicyStampWritePathTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 broker_mod.main()
             self.assertTrue(stamp_path.exists())
+    def test_main_uses_policy_bytes_captured_at_load(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            policy = root / "policy.json"
+            first = b'{"repositories":{"a":{"path":"/tmp/a"}}}\n'
+            second = b'{"repositories":{"b":{"path":"/tmp/b"}}}\n'
+            policy.write_bytes(first)
+            stamp_path = root / "stamp.json"
+            broker_mod = _load_broker({
+                "HERMES_OMP_POLICY": str(policy),
+                "HERMES_OMP_POLICY_STAMP": str(stamp_path),
+                "HERMES_OMP_JOB_DIR": str(root / "jobs"),
+            })
+            policy.write_bytes(second)
+            with mock.patch.object(
+                broker_mod, "systemd_listeners", side_effect=SystemExit,
+            ):
+                with self.assertRaises(SystemExit):
+                    broker_mod.main()
+            stamp = json.loads(stamp_path.read_text())
+            self.assertEqual(
+                _compute_expected_digest(broker_mod._LOADED_SCRIPT_BYTES, first),
+                stamp["policy_pair_digest"],
+            )
+
+    def test_invalid_loaded_policy_does_not_produce_stamp(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            policy = root / "policy.json"
+            policy.write_text("{invalid")
+            stamp_path = root / "stamp.json"
+            broker_mod = _load_broker({
+                "HERMES_OMP_POLICY": str(policy),
+                "HERMES_OMP_POLICY_STAMP": str(stamp_path),
+                "HERMES_OMP_JOB_DIR": str(root / "jobs"),
+            })
+            with mock.patch.object(
+                broker_mod, "systemd_listeners", side_effect=SystemExit,
+            ):
+                with self.assertRaises(SystemExit):
+                    broker_mod.main()
+            self.assertFalse(stamp_path.exists())
 
     def test_unwritable_stamp_path_prints_diagnostic(self) -> None:
         """An absolute-readonly directory does not raise — just stderr."""

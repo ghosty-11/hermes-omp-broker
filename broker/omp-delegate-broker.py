@@ -76,33 +76,28 @@ def write_policy_stamp(
     script_file: str | None = None,
     policy_file: str | None = None,
     stamp_file: Path | None = None,
+    script_bytes: bytes | None = None,
+    policy_bytes: bytes | None = None,
 ) -> dict[str, object] | None:
-    """Write the broker's policy-pair stamp and return its contents.
-
-    Stamp fields are the reporter's contract: pid, start_monotonic_usec,
-    policy_file, script_file, policy_pair_digest, written_at.
-
-    Fail soft: if the directory does not exist or the write is denied,
-    one diagnostic line is printed to stderr and ``None`` is returned.
-    The broker must never refuse to start because of a reporting nicety.
-    """
+    """Write the broker policy-pair stamp, failing soft on reporting errors."""
     stamp_file = stamp_file if stamp_file is not None else BROKER_POLICY_STAMP
-    script_path = Path(script_file if script_file is not None else __file__)
+    script_is_loaded = script_file is None
+    policy_is_loaded = policy_file is None
+    script_path = Path(script_file if script_file is not None else _LOADED_SCRIPT_PATH)
     policy_path = Path(policy_file if policy_file is not None else POLICY_FILE)
-
-    # Resolve to the absolute, normalised form the reporter expects.
-    # os.path.abspath makes absolute without following symlinks.
     script_path = Path(os.path.abspath(script_path))
     policy_path = Path(os.path.abspath(policy_path))
-
     try:
-        script_bytes = script_path.read_bytes()
-        policy_bytes = policy_path.read_bytes()
+        if script_bytes is None:
+            script_bytes = _LOADED_SCRIPT_BYTES if script_is_loaded else script_path.read_bytes()
+        if policy_bytes is None:
+            policy_bytes = _LOADED_POLICY_BYTES if policy_is_loaded else policy_path.read_bytes()
+        if script_bytes is None or policy_bytes is None:
+            raise OSError("loaded policy pair is unavailable")
     except OSError as exc:
         print(f"omp-delegate-broker: cannot read policy pair for stamp: {exc}",
               file=sys.stderr)
         return None
-
     stamp = {
         "pid": os.getpid(),
         "start_monotonic_usec": time.monotonic_ns() // 1000,
@@ -112,22 +107,26 @@ def write_policy_stamp(
         "written_at": datetime.datetime.now(datetime.timezone.utc)
                       .isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-
     stamp_bytes = (json.dumps(stamp, sort_keys=True) + "\n").encode()
     try:
         stamp_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(str(stamp_file),
-                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=stamp_file.name + ".", dir=stamp_file.parent)
         try:
-            os.write(fd, stamp_bytes)
             os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(stamp_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, stamp_file)
         finally:
-            os.close(fd)
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
     except OSError as exc:
-        print(f"omp-delegate-broker: stamp write failed: {exc}",
-              file=sys.stderr)
+        print(f"omp-delegate-broker: stamp write failed: {exc}", file=sys.stderr)
         return None
-
     return stamp
 
 
@@ -206,15 +205,22 @@ LEASE_STORES = _load_lease_stores()
 _ACTIVE_PROCESS_GROUP: int | None = None
 
 
+_LOADED_POLICY_BYTES: bytes | None = None
+_LOADED_SCRIPT_BYTES: bytes | None = None
+_LOADED_SCRIPT_PATH = Path(os.path.abspath(__file__))
+
 def _load_policy() -> tuple[
-    dict[str, set[Path]],
-    dict[str, str],
-    dict[str, Path],
-    dict[str, dict[str, object]],
-    frozenset[str] | None,
+    dict[str, set[Path]], dict[str, str], dict[str, Path],
+    dict[str, dict[str, object]], frozenset[str] | None,
 ]:
+    global _LOADED_POLICY_BYTES, _LOADED_SCRIPT_BYTES
     try:
-        value = json.loads(POLICY_FILE.read_text())
+        _LOADED_POLICY_BYTES = POLICY_FILE.read_bytes()
+        try:
+            _LOADED_SCRIPT_BYTES = _LOADED_SCRIPT_PATH.read_bytes()
+        except OSError:
+            _LOADED_SCRIPT_BYTES = None
+        value = json.loads(_LOADED_POLICY_BYTES)
         repositories = value.get("repositories", {})
         repository_paths = {
             str(name): Path(entry["path"]).resolve()
@@ -223,44 +229,39 @@ def _load_policy() -> tuple[
         }
         raw_callers = value.get("callers")
         if not isinstance(raw_callers, dict):
-            raw_callers = {
-                "delegate_to_omp": {
-                    "repositories": list(repository_paths),
-                    "sandbox": "workspace-write",
-                }
-            }
-        callers = {
-            str(name): entry
-            for name, entry in raw_callers.items()
-            if isinstance(entry, dict)
-        }
+            raw_callers = {"delegate_to_omp": {
+                "repositories": list(repository_paths), "sandbox": "workspace-write"}}
+        callers = {str(name): entry for name, entry in raw_callers.items()
+                   if isinstance(entry, dict)}
         workspaces: dict[str, set[Path]] = {}
         sandboxes: dict[str, str] = {}
         for name, entry in callers.items():
-            repository_names = entry.get("repositories", [])
-            sandbox = entry.get("sandbox")
-            if (
-                isinstance(repository_names, list)
-                and all(isinstance(item, str) for item in repository_names)
-                and isinstance(sandbox, str)
-            ):
-                workspaces[name] = {
-                    repository_paths[item]
-                    for item in repository_names
-                    if item in repository_paths
-                }
+            repository_names, sandbox = entry.get("repositories", []), entry.get("sandbox")
+            if (isinstance(repository_names, list)
+                    and all(isinstance(item, str) for item in repository_names)
+                    and isinstance(sandbox, str)):
+                workspaces[name] = {repository_paths[item] for item in repository_names
+                                    if item in repository_paths}
                 sandboxes[name] = sandbox
-        raw_metered = value.get("metered_models")
-        metered_models: frozenset[str] | None = None
-        if isinstance(raw_metered, list) and all(
-                isinstance(item, str) for item in raw_metered):
-            metered_models = frozenset(raw_metered)
-        return workspaces, sandboxes, repository_paths, callers, metered_models
-    except (OSError, ValueError, TypeError):
+        raw_safe = value.get("replay_safe_models")
+        safe_models = (
+            frozenset(raw_safe) if isinstance(raw_safe, list)
+            and raw_safe and all(
+                isinstance(item, str)
+                and item == item.strip()
+                and item
+                and not any(char.isspace() for char in item)
+                and not any(char in item for char in "*?[]")
+                and "/" in item
+                and bool(item.partition("/")[0])
+                and bool(item.partition("/")[2])
+                for item in raw_safe)
+            else None)
+        return workspaces, sandboxes, repository_paths, callers, safe_models
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        _LOADED_POLICY_BYTES = None
         return {}, {}, {}, {}, None
-
-
-ALLOWED_WORKSPACES, ALLOWED_SANDBOXES, REPOSITORY_PATHS, CALLER_POLICIES, METERED_MODELS = _load_policy()
+ALLOWED_WORKSPACES, ALLOWED_SANDBOXES, REPOSITORY_PATHS, CALLER_POLICIES, REPLAY_SAFE_MODELS = _load_policy()
 REQUEST_FIELDS = {"version", "request_id", "task_id", "repository", "caller", "workspace", "sandbox", "model", "prompt", "timeout"}
 STATUS_REQUEST_FIELDS = {"version", "op", "request_id", "caller", "repository"}
 V2_REQUEST_FIELDS = {"version", "op", "lease_id"}
@@ -514,30 +515,22 @@ def validate_status_request(value: object, *, peer_uid: int) -> StatusRequest:
     return StatusRequest(value["request_id"], value["caller"], value["repository"])
 
 
-def _lane_is_metered(request: Request) -> bool:
-    """True unless policy proves the caller's pinned model and every fallback
-    rung unmetered: an absent or malformed metered_models list refuses
-    re-execution everywhere, because an unknown lane may spend real money."""
-    if METERED_MODELS is None:
-        return True
-    chain = (request.model, *fallback_models(request))
-    return any(model in METERED_MODELS for model in chain)
-
+def _lane_is_replay_safe(request: Request) -> bool:
+    """Require every effective model and fallback to be explicitly safe."""
+    if REPLAY_SAFE_MODELS is None:
+        return False
+    return all(model in REPLAY_SAFE_MODELS
+               for model in (request.model, *fallback_models(request)))
 
 def _arm_resultless_reexecution(
     store: LeaseStore, lease_id: str, request: Request, *,
     endpoint: str, peer_uid: int,
 ) -> None:
-    """consume() refused a spent identity: re-arm the job's single
-    re-execution when its record holds no result row and the caller's lane
-    is unmetered; every other shape keeps reporting unavailable."""
-    if _lane_is_metered(request):
-        print("omp-delegate-broker: v2 execute re-execution denied: "
-              f"metered or unproven lane {request.model!r}", file=sys.stderr)
-        raise ProtocolError(
-            "job unavailable", version=2, operation="execute") from None
+    if not _lane_is_replay_safe(request):
+        raise ProtocolError("job unavailable", version=2, operation="execute")
     try:
-        fixed = store.resolve(lease_id, endpoint=endpoint, peer_uid=peer_uid)
+        fixed = store.resolve_for_reexecution(
+            lease_id, endpoint=endpoint, peer_uid=peer_uid)
         JOB_STORE.arm_reexecution(
             str(fixed["request_id"]), task_id=str(fixed["task_id"]),
             repository=str(fixed["repository"]), caller=str(fixed["caller"]))
@@ -592,8 +585,9 @@ def parse_request(
                 except LeaseUnavailable:
                     # B3 (2026-09-12): the identity is spent. Re-admit the job
                     # exactly once when its record holds no result row and the
-                    # caller's lane is unmetered; every other shape stays
-                    # unavailable instead of looping the authority.
+                    # caller's entire model chain is explicitly replay-safe;
+                    # every other shape stays unavailable instead of looping
+                    # the authority.
                     _arm_resultless_reexecution(
                         store, value["lease_id"], request,
                         endpoint=endpoint, peer_uid=peer_uid)
@@ -1138,6 +1132,9 @@ def _status_error_response(*, version: int = 1) -> dict[str, object]:
         "error": "job unavailable",
     }
 
+def _v2_error_response(operation: str, error: str) -> dict[str, object]:
+    return {"version": 2, "op": operation, "ok": False, "error": error}
+
 def _health_error_response() -> dict[str, object]:
     return {
         "version": 2,
@@ -1353,14 +1350,21 @@ def _send_frame(conn: socket.socket, value: dict[str, object]) -> None:
     if len(payload) > MAX_RESPONSE_BYTES:
         version = value.get("version")
         response_version = version if version in {1, 2} else 1
-        fallback = (
-            _health_error_response()
-            if value.get("op") == "health"
-            else _status_error_response(version=response_version)
-            if value.get("op") == "status"
-            else _error_response(
-                "response exceeded size bound", version=response_version)
-        )
+        operation = value.get("op")
+        if operation is None and response_version == 2 and "exit_code" in value:
+            operation = "execute"
+        if response_version == 2 and operation in {"execute", "status"}:
+            fallback = _v2_error_response(
+                operation, "response exceeded size bound")
+        else:
+            fallback = (
+                _health_error_response()
+                if operation == "health"
+                else _status_error_response(version=response_version)
+                if operation == "status"
+                else _error_response(
+                    "response exceeded size bound", version=response_version)
+            )
         payload = json.dumps(fallback, separators=(",", ":")).encode()
     conn.sendall(struct.pack("!I", len(payload)) + payload)
 
@@ -1423,21 +1427,17 @@ def _serve_connection(
         if not allow_v1:
             version = 2
             operation = exc.operation if isinstance(exc, ProtocolError) else "execute"
-            message = (
-                "endpoint unavailable" if operation == "health"
-                else "job unavailable"
-            )
+            if operation == "health":
+                response = _health_error_response()
+            elif operation == "status":
+                response = _status_error_response(version=2)
+            else:
+                response = _v2_error_response("execute", "job unavailable")
         else:
             version = exc.version if isinstance(exc, ProtocolError) else 1
             operation = exc.operation if isinstance(exc, ProtocolError) else "execute"
-            message = str(exc)
-        response = (
-            _health_error_response()
-            if version == 2 and operation == "health"
-            else _status_error_response(version=version)
-            if version == 2 and operation == "status"
-            else _error_response(message, request_id=request_id, version=version)
-        )
+            response = _error_response(
+                str(exc), request_id=request_id, version=version)
     try:
         _send_frame(conn, response)
     except OSError:
@@ -1504,8 +1504,6 @@ def _terminate(signum: int, _frame: object) -> None:
     if _ACTIVE_PROCESS_GROUP is not None:
         _kill_process_group(_ACTIVE_PROCESS_GROUP)
     raise SystemExit(128 + signum)
-
-
 def main() -> int:
     write_policy_stamp()
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):

@@ -138,9 +138,8 @@ class ZombieJobTests(ResilienceHarness):
 
 
 class MaskingDiagnosticTests(ResilienceHarness):
-    """The wire stays generic for lease-bound callers, but the journal must
-    carry the true failure — on 2026-08-26 the masking reduced three distinct
-    root causes to 'job unavailable' and cost hours of blind diagnosis."""
+    """The wire uses explicit v2 admission errors, while the journal carries
+    the true failure reason for operator diagnosis."""
 
     def _exchange(self, module, raw_payload: bytes) -> tuple[dict, str]:
         client, server = socket.socketpair()
@@ -160,8 +159,42 @@ class MaskingDiagnosticTests(ResilienceHarness):
             td = Path(raw)
             module, _ = self._load(td)
             response, err = self._exchange(module, b'{"version": 2, not json')
-            self.assertIn("job unavailable", response["stderr"])
+            self.assertEqual(
+                {"version": 2, "op": "execute", "ok": False,
+                 "error": "job unavailable"}, response)
             self.assertIn("JSONDecodeError", err)
+    def test_oversized_v2_frames_use_operation_specific_error(self):
+        with tempfile.TemporaryDirectory() as raw:
+            td = Path(raw)
+            module, _ = self._load(td)
+            left, right = socket.socketpair()
+            self.addCleanup(left.close)
+            self.addCleanup(right.close)
+            with mock.patch.object(module, "MAX_RESPONSE_BYTES", 1):
+                module._send_frame(right, {
+                    "version": 2, "op": "status", "ok": True,
+                    "job": {"oversized": True},
+                })
+            size = int.from_bytes(left.recv(4), "big")
+            self.assertEqual(
+                {"version": 2, "op": "status", "ok": False,
+                 "error": "response exceeded size bound"},
+                json.loads(left.recv(size)))
+            left2, right2 = socket.socketpair()
+            self.addCleanup(left2.close)
+            self.addCleanup(right2.close)
+            with mock.patch.object(module, "MAX_RESPONSE_BYTES", 1):
+                module._send_frame(right2, {"version": 2, "exit_code": 0,
+                                             "stdout": "x", "stderr": "",
+                                             "timed_out": False,
+                                             "process_group_clear": True,
+                                             "final": None, "request_id": "id"})
+            size2 = int.from_bytes(left2.recv(4), "big")
+            self.assertEqual(
+                {"version": 2, "op": "execute", "ok": False,
+                 "error": "response exceeded size bound"},
+                json.loads(left2.recv(size2)))
+
 
     def test_consumed_lease_rejection_names_the_lease_in_the_journal(self):
         """The 22:59 production shape: a resubmitted consumed lease answered
@@ -172,7 +205,9 @@ class MaskingDiagnosticTests(ResilienceHarness):
             payload = json.dumps({"version": 2, "op": "execute",
                                   "lease_id": "nonexistent"}).encode()
             response, err = self._exchange(module, payload)
-            self.assertIn("job unavailable", response["stderr"])
+            self.assertEqual(
+                {"version": 2, "op": "execute", "ok": False,
+                 "error": "job unavailable"}, response)
             self.assertIn("LeaseUnavailable", err)
 
 

@@ -499,7 +499,7 @@ class BrokerPolicyTest(unittest.TestCase):
 
 
 class ProtocolV2LeaseTest(unittest.TestCase):
-    def _load(self, root: Path, *, metered_models: tuple[str, ...] | None = ()):
+    def _load(self, root: Path, *, replay_safe_models: tuple[str, ...] | None = ("provider/fixed",)):
         policy = root / "policy.json"
         workspace = root / "repo"
         workspace.mkdir(parents=True, exist_ok=True)
@@ -517,8 +517,8 @@ class ProtocolV2LeaseTest(unittest.TestCase):
                 "max_timeout": 60,
             }},
         }
-        if metered_models is not None:
-            document["metered_models"] = list(metered_models)
+        if replay_safe_models is not None:
+            document["replay_safe_models"] = list(replay_safe_models)
         policy.write_text(json.dumps(document))
         for endpoint in ("audit", "planner", "code"):
             store_root = root / "leases" / endpoint
@@ -1029,46 +1029,57 @@ class ProtocolV2LeaseTest(unittest.TestCase):
                         process.communicate.return_value = (b"", b"")
                         return process
 
-                    conn = socket.socketpair()
+                    left, right = socket.socketpair()
+                    try:
+                        with mock.patch.object(module, "record_audit"), \
+                                mock.patch.object(
+                                    module, "_process_group_exists",
+                                    return_value=False), \
+                                mock.patch.object(
+                                    module, "acquire_workspace_lock",
+                                    return_value=mock.Mock()), \
+                                mock.patch.object(
+                                    module, "resolve_provider_api_keys",
+                                    return_value={}), \
+                                mock.patch.object(
+                                    module, "start_omp_process",
+                                    side_effect=fake_start):
+                            # Attempt 2: the spent lease re-executes once.
+                            request = module.parse_request(
+                                execute, endpoint="audit", peer_uid=997)
+                            response = module.run_request(request, right)
+                        self.assertEqual(2, response["version"])
+                        record = module.JOB_STORE.get("request-1")
+                        self.assertTrue(record["reexecuted"])
+                        self.assertEqual("completed", record["status"])
+                        self.assertIsNotNone(record["result"])
+                        # Attempt 3 reports unavailable instead of re-running.
+                        with self.assertRaises(module.ProtocolError) as raised:
+                            module.parse_request(execute, endpoint="audit", peer_uid=997)
+                        self.assertEqual("job unavailable", str(raised.exception))
+                        self.assertEqual(1, len(list(store.consumed.glob("*.json"))))
+                    finally:
+                        left.close()
+                        right.close()
 
-                    with mock.patch.object(module, "record_audit"), \
-                            mock.patch.object(
-                                module, "_process_group_exists",
-                                return_value=False), \
-                            mock.patch.object(
-                                module, "acquire_workspace_lock",
-                                return_value=mock.Mock()), \
-                            mock.patch.object(
-                                module, "resolve_provider_api_keys",
-                                return_value={}), \
-                            mock.patch.object(
-                                module, "start_omp_process",
-                                side_effect=fake_start):
-                        # Attempt 2: the spent lease re-executes once.
-                        request = module.parse_request(
-                            execute, endpoint="audit", peer_uid=997)
-                        response = module.run_request(request, conn[1])
-                    self.assertEqual(2, response["version"])
-                    record = module.JOB_STORE.get("request-1")
-                    self.assertTrue(record["reexecuted"])
-                    self.assertEqual("completed", record["status"])
-                    self.assertIsNotNone(record["result"])
-                    # Attempt 3 reports unavailable instead of re-running.
-                    with self.assertRaises(module.ProtocolError) as raised:
-                        module.parse_request(execute, endpoint="audit", peer_uid=997)
-                    self.assertEqual("job unavailable", str(raised.exception))
-                    self.assertEqual(1, len(list(store.consumed.glob("*.json"))))
 
-    def test_metered_or_unknown_lanes_refuse_reexecution(self) -> None:
+    def test_unsafe_or_unknown_lanes_refuse_reexecution(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            for name, metered, rungs in (
+            for name, safe_models, rungs in (
                 ("unknown", None, ()),
-                ("pinned-model", ("provider/fixed",), ()),
-                ("fallback-rung", ("provider/cheap",), ("provider/cheap",)),
+                ("empty", (), ()),
+                ("malformed", ("provider/fixed", 7), ()),
+                ("mixed", ("provider/fixed", "unqualified-model"), ()),
+                ("empty-provider", ("/model",), ()),
+                ("empty-model", ("provider/",), ()),
+                ("whitespace", ("provider/model name",), ()),
+                ("glob", ("provider/model?",), ()),
+                ("wildcard", ("provider/*",), ()),
+                ("unclassified-fallback", ("provider/fixed",), ("provider/cheap",)),
             ):
                 with self.subTest(name=name):
                     root = Path(td) / name
-                    module = self._load(root, metered_models=metered)
+                    module = self._load(root, replay_safe_models=safe_models)
                     if rungs:
                         module.CALLER_POLICIES["audit"]["fallback_models"] = (
                             list(rungs))
@@ -1086,6 +1097,40 @@ class ProtocolV2LeaseTest(unittest.TestCase):
                     self.assertNotIn("reexecuted", record)
                     self.assertEqual("pending", record["status"])
                     self.assertEqual(1, len(list(store.consumed.glob("*.json"))))
+    def test_expired_consumed_replay_is_denied_but_status_remains_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            module = self._load(root)
+            store = module.LEASE_STORES["audit"]
+            lease_id = self._issue(module, root, expires_at=__import__("time").time_ns() // 1_000_000_000 + 60)
+            execute = {"version": 2, "op": "execute", "lease_id": lease_id}
+            module.parse_request(execute, endpoint="audit", peer_uid=997)
+            module.JOB_STORE.create(
+                "request-1", task_id="task-1", repository="repo", caller="audit")
+            with mock.patch.object(module.time, "time", return_value=__import__("time").time() + 120):
+                with self.assertRaises(module.ProtocolError):
+                    module.parse_request(execute, endpoint="audit", peer_uid=997)
+                status = module.parse_request(
+                    {"version": 2, "op": "status", "lease_id": lease_id},
+                    endpoint="audit", peer_uid=997)
+            self.assertEqual("request-1", status.request_id)
+            self.assertEqual(1, len(list(store.consumed.glob("*.json"))))
+
+    def test_explicitly_safe_primary_and_fallback_chain_allows_reexecution(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            module = self._load(
+                root, replay_safe_models=("provider/fixed", "provider/cheap"))
+            module.CALLER_POLICIES["audit"]["fallback_models"] = ["provider/cheap"]
+            lease_id = self._issue(module, root)
+            execute = {"version": 2, "op": "execute", "lease_id": lease_id}
+            module.parse_request(execute, endpoint="audit", peer_uid=997)
+            module.JOB_STORE.create(
+                "request-1", task_id="task-1", repository="repo", caller="audit")
+            request = module.parse_request(
+                execute, endpoint="audit", peer_uid=997)
+            self.assertTrue(request.reexecuted)
+
 
     def test_happy_path_consumes_the_lease_exactly_once(self) -> None:
         with tempfile.TemporaryDirectory() as td:

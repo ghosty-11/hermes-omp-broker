@@ -14,6 +14,11 @@ journalctl --user-unit omp-delegate-broker.service --since today
 For each request, correlate the request ID with its existing task ID, policy decision,
 durable job record, process group, typed final, Git evidence, verification exits, cleanup,
 and bounded redacted output. A model summary or `MET` verdict is not broker evidence.
+At startup, the broker captures the policy and script bytes that it loaded and writes an
+atomic policy-pair stamp in its writable agent directory. The stamp records the loaded-byte
+digest and process identity; it does not reread a later policy file. Importing the module
+does not write a stamp, and a reporting failure is fail-soft. Boundary freshness compares
+the running stamp with the deployed pair.
 
 ## Cancellation, timeout, and restart
 
@@ -21,7 +26,9 @@ Cancellation and timeout must terminate descendants and wait for process-group c
 Preserve dirty repository evidence. On service restart, the broker classifies persisted
 `pending` and `running` records as `orphaned` before admitting new work; it does not resume
 or clean their checkouts automatically. A completed result whose socket delivery fails is
-retained as `delivery_failed` for operator retrieval from the private job store.
+retained as `delivery_failed` for operator retrieval from the private job store. Terminal
+results remain durable across launcher retries and model repinning; a launcher must replay
+the validated result rather than dispatching a replacement job.
 
 Do not delete an orphan or retry against the same checkout until the operator has inspected
 the repository, process tree, job record, and audit entry. A deterministic cancellation
@@ -63,11 +70,30 @@ creation; the broker never rewrites the issued record, so a policy rejection
 leaves the lease unconsumed. A torn tombstone remains a replay denial.
 Completion, failure, timeout, disconnect, and delivery failure do not make the
 capability reusable. A restart or fault that leaves the job without a result row
-admits exactly one re-execution of the spent lease — tracked by a `reexecuted`
-flag in the job record — and only when the caller's pinned model and every
-fallback rung are absent from the policy's optional top-level `metered_models`
-list; a missing or malformed list refuses re-execution everywhere. Status joins
-the immutable issued record with its valid consumed tombstone.
+admits exactly one re-execution of the spent lease, tracked by a `reexecuted`
+flag in the job record, only when the caller's pinned model and every fallback rung
+are positively listed in the policy's exact top-level `replay_safe_models` list.
+Missing, empty, malformed, wildcard, or unknown entries deny re-execution; there
+is no compatibility alias for the former `metered_models` field. Status joins the
+immutable issued record with its valid consumed tombstone. The execution deadline
+controls whether re-execution may be armed; status remains readable after expiry,
+and result-bearing terminal jobs never re-execute.
+The launcher replays a validated durable terminal result before checking current
+dispatch-model admission. A validated `orphaned` resultless status, or the typed
+`job unavailable` status error, may trigger the one-shot execute attempt; pending
+or running statuses remain pending, and malformed or ambiguous status never arms
+execution. Corrupt or phase-less result records block with their path and parser
+cause rather than reading as absent.
+
+Protocol-v2 errors use exact four-field envelopes:
+`{"version":2,"op":"execute"|"status","ok":false,"error":...}`. A pre-admission
+execute refusal uses `error:"job unavailable"` and maps to
+`execution-rejected`. Oversized execute or status replies use
+`error:"response exceeded size bound"` and map to `response-too-large`; the
+durable broker record and child result remain untouched, and launchers do not
+reexecute. Ordinary child failures, malformed envelopes, transport failures,
+and post-processing failures remain generic. Protocol-v1 responses retain their
+existing format and behavior.
 
 Protocol v2 health is a no-spend live canary. The launcher sends exactly
 `{"version":2,"op":"health"}` through its mapped endpoint. The broker verifies the endpoint
@@ -96,11 +122,11 @@ The service units that activate protocol v2 must provide all of the following de
   shared.
 
 Roll out protocol v2 by replacing the client, broker, launchers, policy, and service units as
-one pinned set after full disposable-host validation. Do not activate the retained protocol
-v1 compatibility functions. To roll back during source staging, discard the source changes;
-no live state requires migration. After a protocol v2 deployment, disable every launcher and
-socket before restoring the complete pinned protocol v1 set. Retain protocol v2 lease and job
-records for reconciliation, and do not translate an existing lease into a protocol v1
+one pinned set after disposable-host validation. Do not activate the retained protocol-v1
+compatibility functions as an ad hoc fallback. During source-only staging, no live state
+requires migration. After deployment, quiesce every launcher and socket before restoring
+the last reviewed, mutually compatible broker/client/policy set. Retain lease and job
+records for reconciliation; never translate an existing v2 lease into a protocol-v1
 request.
 
 ## Upgrade
@@ -120,11 +146,11 @@ request.
 
 Disable the Hermes tool and stop the socket/service. Restore the previous pinned
 client/broker/extension/plugin/skill/unit bytes plus the compatible policy and environment.
-A policy that lists `fallback_models` or admits `backlog-maturation-research` is not
-compatible with a broker or extension from before those fields. Restore the matching
-policy with the matching bytes; do not leave a research caller pointed at an older
-extension. Do not roll job state backward over newer records; retain the pre-rollback
-copy for reconciliation. Run:
+A policy that admits `backlog-maturation-research` or uses the exact
+`replay_safe_models` replay contract is not compatible with a broker or extension from
+before those fields. Restore the matching policy with the matching bytes; do not leave a
+research caller pointed at an older extension. Do not roll job state backward over newer
+records; retain the pre-rollback copy for reconciliation.
 
 ```sh
 systemctl --user daemon-reload

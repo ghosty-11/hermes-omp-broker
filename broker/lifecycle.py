@@ -378,21 +378,47 @@ class LeaseStore:
                 raise LeaseUnavailable(LEASE_UNAVAILABLE) from None
             return dict(record["fixed_request"])
 
-    def retire_consumed(self) -> int:
+    def resolve_for_reexecution(
+        self, lease_id: str, *, endpoint: str, peer_uid: int,
+    ) -> dict[str, Any]:
+        """Resolve a consumed lease only while its execution deadline remains open."""
+        with self._locked():
+            record = self._read_bound(
+                lease_id, endpoint=endpoint, peer_uid=peer_uid)
+            try:
+                tombstone = self._read_tombstone(
+                    self._consumed_path(lease_id), record)
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                raise LeaseUnavailable(LEASE_UNAVAILABLE) from None
+            consumed_at = tombstone.get("consumed_at")
+            expires_at = record.get("expires_at")
+            if (
+                isinstance(consumed_at, bool)
+                or not isinstance(consumed_at, int)
+                or consumed_at > int(time.time())
+                or isinstance(expires_at, bool)
+                or not isinstance(expires_at, int)
+                or expires_at <= int(time.time())
+            ):
+                raise LeaseUnavailable(LEASE_UNAVAILABLE)
+            return dict(record["fixed_request"])
+
+    def retire_consumed(self, *, protected_request_ids: tuple[str, ...] = ()) -> int:
         """Retire issued records proven consumed by a matching, over-age tombstone."""
+        protected = set(protected_request_ids)
         retired = 0
         with self._locked():
             for candidate in list(self.issued.glob("*.json")):
                 try:
                     record = self._read_issued_path(candidate)
                 except (OSError, KeyError, TypeError, ValueError):
-                    # A corrupt record must survive to keep failing issue() closed.
+                    continue
+                if record.get("request_id") in protected:
                     continue
                 try:
                     tombstone = self._read_tombstone(
                         self.consumed / f"{candidate.stem}.json", record)
                 except (LeaseUnavailable, OSError, KeyError, TypeError, ValueError):
-                    # Anything short of a valid matching tombstone proves nothing.
                     continue
                 consumed_at = tombstone.get("consumed_at")
                 if (
@@ -406,11 +432,11 @@ class LeaseStore:
         return retired
 
 
+
 class JobStore:
     def __init__(self, root: Path) -> None:
         self.root = root
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
-
     def _path(self, request_id: str) -> Path:
         if not request_id or not all(char.isalnum() or char in "_-" for char in request_id):
             raise ValueError("invalid request identifier")
@@ -448,30 +474,35 @@ class JobStore:
         if path.exists():
             raise ValueError("request identifier already exists")
         now = int(time.time())
-        self._write({"version": 1, "request_id": request_id, "task_id": task_id, "repository": repository, "caller": caller, "status": "pending", "process_group": None, "result": None, "created_at": now, "updated_at": now})
+        self._write({"version": 1, "request_id": request_id, "task_id": task_id,
+                     "repository": repository, "caller": caller, "status": "pending",
+                     "process_group": None, "result": None, "created_at": now,
+                     "updated_at": now})
 
     def arm_reexecution(
         self, request_id: str, *, task_id: str, repository: str, caller: str,
     ) -> None:
-        """Admit the job's single re-execution: a result-less record is
-        re-armed and marked; a spent, answered, or foreign record is refused."""
         record = self.get(request_id)
         if (
             record.get("reexecuted")
             or record.get("result") is not None
+            or record.get("status") not in {"pending", "orphaned"}
+            or record.get("process_group") is not None
             or record.get("task_id") != task_id
             or record.get("repository") != repository
             or record.get("caller") != caller
         ):
             raise ValueError("job record does not admit re-execution")
-        record.update(
-            status="pending", process_group=None, reexecuted=True,
-            updated_at=int(time.time()))
+        record.update(status="pending", process_group=None, reexecuted=True,
+                      updated_at=int(time.time()))
         self._write(record)
 
-    def _transition(self, request_id: str, status: str, *, process_group: int | None = None, result: dict[str, Any] | None = None) -> None:
+    def _transition(self, request_id: str, status: str, *,
+                    process_group: int | None = None,
+                    result: dict[str, Any] | None = None) -> None:
         record = self.get(request_id)
-        record.update(status=status, process_group=process_group, updated_at=int(time.time()))
+        record.update(status=status, process_group=process_group,
+                      updated_at=int(time.time()))
         if result is not None:
             record["result"] = result
         self._write(record)

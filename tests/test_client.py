@@ -172,6 +172,34 @@ class TestOmpInvoke(unittest.TestCase):
             with self.subTest(changed=changed):
                 with self.assertRaises(self.module.InvocationError):
                     self.module.validate_response(changed)
+    def test_v2_error_envelopes_are_typed_and_exit_69_is_generic(self) -> None:
+        refusal = {"version": 2, "op": "execute", "ok": False,
+                   "error": "job unavailable"}
+        with self.assertRaises(self.module.ExecutionRejectedError):
+            self.module.validate_response(refusal, version=2)
+        too_large = {"version": 2, "op": "execute", "ok": False,
+                     "error": "response exceeded size bound"}
+        with self.assertRaises(self.module.ResponseTooLargeError):
+            self.module.validate_response(too_large, version=2)
+        child_69 = {
+            "version": 2, "exit_code": 69, "stdout": "", "stderr": "child failed",
+            "timed_out": False, "process_group_clear": True, "final": None,
+            "request_id": "id",
+        }
+        with self.assertRaises(self.module.InvocationError) as raised:
+            self.module.validate_response(child_69, version=2)
+        self.assertNotIsInstance(raised.exception, self.module.ExecutionRejectedError)
+        malformed = {**too_large, "error": "not a protocol error"}
+        with self.assertRaises(self.module.InvocationError):
+            self.module.validate_response(malformed, version=2)
+        with self.assertRaises(self.module.InvocationError):
+            self.module.validate_response({**refusal, "op": "status"}, version=2)
+
+    def test_v2_transport_failure_remains_generic(self) -> None:
+        with mock.patch.object(self.module.socket, "socket", side_effect=OSError("offline")):
+            with self.assertRaises(self.module.InvocationError) as raised:
+                self.module.invoke_broker_v2(Path("/missing.sock"), "lease", "execute")
+        self.assertNotIsInstance(raised.exception, self.module.ExecutionRejectedError)
 
     def test_response_accepts_bounded_structured_result_json(self) -> None:
         base = {
@@ -324,11 +352,29 @@ class TestOmpInvoke(unittest.TestCase):
                 chunk, self.buffer = self.buffer[:size], self.buffer[size:]
                 return chunk
         with mock.patch.object(self.module.socket, "socket", return_value=FakeSocket()):
-            with self.assertRaises(self.module.InvocationError) as raised:
+            with self.assertRaises(self.module.JobUnavailableError) as raised:
                 self.module.invoke_broker_v2(Path("/fixed.sock"), "lease", "status")
+        self.assertEqual("job-unavailable", raised.exception.code)
         self.assertEqual("job unavailable", str(raised.exception))
         self.assertEqual(
             [{"version": 2, "op": "status", "lease_id": "lease"}], sent)
+
+    def test_v2_status_response_size_error_is_typed(self) -> None:
+        with self.assertRaises(self.module.ResponseTooLargeError) as raised:
+            self.module.validate_response(
+                {"version": 2, "op": "status", "ok": False,
+                 "error": "response exceeded size bound"},
+                version=2,
+            )
+        self.assertEqual("response-too-large", raised.exception.code)
+    def test_v1_status_unavailable_remains_generic(self) -> None:
+        with self.assertRaises(self.module.InvocationError) as raised:
+            self.module.validate_status_response(
+                {"version": 1, "op": "status", "ok": False,
+                 "error": "job unavailable"},
+                request_id="req", caller="caller", repository="repo",
+            )
+        self.assertNotIsInstance(raised.exception, self.module.JobUnavailableError)
 
 
     def test_v2_health_sends_exact_no_spend_canary_and_validates_exact_response(self) -> None:
