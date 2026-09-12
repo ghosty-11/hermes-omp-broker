@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import fcntl
 import hashlib
 import json
@@ -46,6 +47,84 @@ MAX_TIMEOUT = 810.0
 ABSOLUTE_MAX_TIMEOUT = 3600.0
 FRAME_TIMEOUT = 5.0
 JOB_STORE = JobStore(Path(os.environ.get("HERMES_OMP_JOB_DIR", "state/jobs")))
+
+
+BROKER_POLICY_STAMP = Path(os.environ.get(
+    "HERMES_OMP_POLICY_STAMP",
+    str(Path(os.environ.get(
+        "HERMES_OMP_AGENT_DIR", "state/agent")).parent / "broker-policy.json"),
+))
+
+
+def policy_pair_digest(script_bytes: bytes, policy_bytes: bytes) -> str:
+    """SHA-256 digest of the (script, policy) pair.
+
+    The reporter computes the same value from the deployed files.
+    """
+    script_row = "sha256:" + hashlib.sha256(script_bytes).hexdigest()
+    policy_row = "sha256:" + hashlib.sha256(policy_bytes).hexdigest()
+    payload = f"{script_row}\n{policy_row}"
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def write_policy_stamp(
+    *,
+    script_file: str | None = None,
+    policy_file: str | None = None,
+    stamp_file: Path | None = None,
+) -> dict[str, object] | None:
+    """Write the broker's policy-pair stamp and return its contents.
+
+    Stamp fields are the reporter's contract: pid, start_monotonic_usec,
+    policy_file, script_file, policy_pair_digest, written_at.
+
+    Fail soft: if the directory does not exist or the write is denied,
+    one diagnostic line is printed to stderr and ``None`` is returned.
+    The broker must never refuse to start because of a reporting nicety.
+    """
+    stamp_file = stamp_file if stamp_file is not None else BROKER_POLICY_STAMP
+    script_path = Path(script_file if script_file is not None else __file__)
+    policy_path = Path(policy_file if policy_file is not None else POLICY_FILE)
+
+    # Resolve to the absolute, normalised form the reporter expects.
+    # os.path.abspath makes absolute without following symlinks.
+    script_path = Path(os.path.abspath(script_path))
+    policy_path = Path(os.path.abspath(policy_path))
+
+    try:
+        script_bytes = script_path.read_bytes()
+        policy_bytes = policy_path.read_bytes()
+    except OSError as exc:
+        print(f"omp-delegate-broker: cannot read policy pair for stamp: {exc}",
+              file=sys.stderr)
+        return None
+
+    stamp = {
+        "pid": os.getpid(),
+        "start_monotonic_usec": time.monotonic_ns() // 1000,
+        "policy_file": str(policy_path),
+        "script_file": str(script_path),
+        "policy_pair_digest": policy_pair_digest(script_bytes, policy_bytes),
+        "written_at": datetime.datetime.now(datetime.timezone.utc)
+                      .isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+
+    stamp_bytes = (json.dumps(stamp, sort_keys=True) + "\n").encode()
+    try:
+        stamp_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(stamp_file),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, stamp_bytes)
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        print(f"omp-delegate-broker: stamp write failed: {exc}",
+              file=sys.stderr)
+        return None
+
+    return stamp
 
 
 def _load_lease_stores() -> dict[str, LeaseStore]:
@@ -1366,6 +1445,7 @@ def _terminate(signum: int, _frame: object) -> None:
 
 
 def main() -> int:
+    write_policy_stamp()
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, _terminate)
     serve_named(systemd_listeners())
