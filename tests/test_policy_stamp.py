@@ -49,11 +49,13 @@ class PolicyStampDigestTest(unittest.TestCase):
             script.write_bytes(script_bytes)
             policy.write_bytes(policy_bytes)
 
-            # The function doesn't exist yet — this must fail red.
             broker_mod = _load_broker({"HERMES_OMP_POLICY": str(policy)})
             stamp = broker_mod.write_policy_stamp(
                 script_file=str(script),
                 policy_file=str(policy),
+                # Isolation: without this the writer falls back to the
+                # deployed path and a test run stamps production state.
+                stamp_file=td_path / "stamp.json",
             )
 
             self.assertIsNotNone(stamp)
