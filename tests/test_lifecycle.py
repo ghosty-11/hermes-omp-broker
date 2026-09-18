@@ -92,14 +92,12 @@ class LifecycleTest(unittest.TestCase):
                 "req", task_id="task", repository="repo", caller="caller")
         self.assertTrue(restarted.get("req")["reexecuted"])
 
-    def test_reexecution_rejects_live_cancelled_failed_and_missing_records(self) -> None:
+    def test_reexecution_rejects_live_failed_and_missing_records(self) -> None:
         self.store.create("live", task_id="task", repository="repo", caller="caller")
         self.store.running("live", process_group=123)
-        self.store.create("cancelled", task_id="task", repository="repo", caller="caller")
-        self.store._transition("cancelled", "cancelled")
         self.store.create("failed", task_id="task", repository="repo", caller="caller")
         self.store.finish("failed", "failed", {})
-        for request_id in ("live", "cancelled", "failed"):
+        for request_id in ("live", "failed"):
             with self.subTest(request_id=request_id):
                 with self.assertRaises(ValueError):
                     self.store.arm_reexecution(
@@ -107,6 +105,44 @@ class LifecycleTest(unittest.TestCase):
         with self.assertRaises(OSError):
             self.store.arm_reexecution(
                 "missing", task_id="task", repository="repo", caller="caller")
+
+    def test_arm_reexecution_allows_client_disconnect_cancellation_only(self) -> None:
+        self.store.create("cancelled", task_id="task", repository="repo", caller="caller")
+        cancellation = {"request_id": "cancelled", "timed_out": False, "final": None}
+        self.store.finish("cancelled", "cancelled", cancellation)
+        self.store.arm_reexecution(
+            "cancelled", task_id="task", repository="repo", caller="caller")
+        record = self.store.get("cancelled")
+        self.assertEqual("pending", record["status"])
+        self.assertTrue(record["reexecuted"])
+        self.assertIsNone(record["result"])
+
+    def test_arm_reexecution_refuses_a_cancellation_that_carries_a_final(self) -> None:
+        """The broker ranks `cancelled` above `completed` on a hang-up, so a
+        record can be cancelled *after* the child wrote a final; re-running it
+        would discard the only durable copy of a successful outcome."""
+        self.store.create("late", task_id="task", repository="repo", caller="caller")
+        self.store.finish(
+            "late", "cancelled",
+            {"request_id": "late", "timed_out": False, "final": {"verdict": "MET"}})
+        with self.assertRaises(ValueError):
+            self.store.arm_reexecution(
+                "late", task_id="task", repository="repo", caller="caller")
+
+    def test_arm_reexecution_refuses_completed_running_and_reexecuted_records(self) -> None:
+        self.store.create("completed", task_id="task", repository="repo", caller="caller")
+        self.store.finish("completed", "completed", {"request_id": "completed"})
+        self.store.create("running", task_id="task", repository="repo", caller="caller")
+        self.store.running("running", process_group=123)
+        self.store.create("reexecuted", task_id="task", repository="repo", caller="caller")
+        self.store.arm_reexecution(
+            "reexecuted", task_id="task", repository="repo", caller="caller")
+        for request_id in ("completed", "running", "reexecuted"):
+            with self.subTest(request_id=request_id):
+                with self.assertRaises(ValueError):
+                    self.store.arm_reexecution(
+                        request_id, task_id="task", repository="repo", caller="caller")
+
 
 
 class LeaseRetirementTest(unittest.TestCase):

@@ -483,18 +483,30 @@ class JobStore:
         self, request_id: str, *, task_id: str, repository: str, caller: str,
     ) -> None:
         record = self.get(request_id)
+        status = record.get("status")
+        result = record.get("result")
+        has_outcome = result is not None
+        # A cancellation is re-runnable only when the child died without an
+        # outcome. The broker ranks `cancelled` above `completed` when it
+        # detects the hang-up, so a record can be cancelled *after* the child
+        # wrote a final; re-running that one would discard the only durable
+        # copy of a successful outcome.
+        cancellation = (
+            status == "cancelled"
+            and (not has_outcome
+                 or (isinstance(result, dict) and result.get("final") is None)))
         if (
             record.get("reexecuted")
-            or record.get("result") is not None
-            or record.get("status") not in {"pending", "orphaned"}
+            or (has_outcome and not cancellation)
+            or status not in {"pending", "orphaned", "cancelled"}
             or record.get("process_group") is not None
             or record.get("task_id") != task_id
             or record.get("repository") != repository
             or record.get("caller") != caller
         ):
             raise ValueError("job record does not admit re-execution")
-        record.update(status="pending", process_group=None, reexecuted=True,
-                      updated_at=int(time.time()))
+        record.update(status="pending", process_group=None, result=None,
+                      reexecuted=True, updated_at=int(time.time()))
         self._write(record)
 
     def _transition(self, request_id: str, status: str, *,

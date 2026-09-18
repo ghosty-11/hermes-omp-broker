@@ -69,15 +69,16 @@ precedes credential resolution, job creation, audit output, or child-process
 creation; the broker never rewrites the issued record, so a policy rejection
 leaves the lease unconsumed. A torn tombstone remains a replay denial.
 Completion, failure, timeout, disconnect, and delivery failure do not make the
-capability reusable. A restart or fault that leaves the job without a result row
-admits exactly one re-execution of the spent lease, tracked by a `reexecuted`
+capability reusable. A restart or fault that leaves the job without a result row,
+and a client-disconnect cancellation whose result envelope carries no final, each
+admit exactly one re-execution of the spent lease, tracked by a `reexecuted`
 flag in the job record, only when the caller's pinned model and every fallback rung
 are positively listed in the policy's exact top-level `replay_safe_models` list.
 Missing, empty, malformed, wildcard, or unknown entries deny re-execution; there
 is no compatibility alias for the former `metered_models` field. Status joins the
 immutable issued record with its valid consumed tombstone. The execution deadline
 controls whether re-execution may be armed; status remains readable after expiry,
-and result-bearing terminal jobs never re-execute.
+and a terminal job whose result carries a final never re-executes.
 The launcher replays a validated durable terminal result before checking current
 dispatch-model admission. A validated `orphaned` resultless status, or the typed
 `job unavailable` status error, may trigger the one-shot execute attempt; pending
