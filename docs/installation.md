@@ -40,9 +40,9 @@ install -d -m 0700 \
   "$HOME/.local/libexec/hermes-omp-broker" \
   "$HOME/.config/hermes-omp-broker" \
   "$HOME/.config/systemd/user"
-install -m 0700 broker/omp-delegate-broker.py \
+install -m 0755 broker/omp-delegate-broker.py \
   "$HOME/.local/libexec/hermes-omp-broker/omp-delegate-broker.py"
-install -m 0600 broker/lifecycle.py \
+install -m 0644 broker/lifecycle.py \
   "$HOME/.local/libexec/hermes-omp-broker/lifecycle.py"
 install -m 0600 extension/omp-delegate-extension.ts \
   "$HOME/.local/libexec/hermes-omp-broker/omp-delegate-extension.ts"
@@ -51,10 +51,20 @@ install -m 0644 systemd/omp-delegate-broker.service \
   "$HOME/.config/systemd/user/"
 ```
 
+The two script modes are load-bearing rather than incidental. The boundary check's
+private-artifact contract requires `0755` for `omp-delegate-broker.py` and `0644` for every
+`lifecycle.py` copy, so following this block with mode `0600` turns that check red. Secrets
+are not in these files: they live in the sibling credential directory, which is mode `0700`.
+
 Create a mode-`0600` policy from `examples/policy.json`. Use absolute repository paths;
 set `model` to the exact provider/model admitted by the broker; keep caller repository
 lists and sandbox modes narrow. Create
 `$HOME/.config/hermes-omp-broker/environment` mode `0600` with absolute values:
+
+If the coding identity's policy is the same file the caller reads, mode `0600` breaks the
+caller, and the boundary check's private-artifact contract pins that file at `0644` instead.
+Keep the two files separate, or make the shared one mode `0644` and keep it free of
+credentials and secrets.
 
 ```text
 HERMES_OMP_POLICY=/absolute/path/to/policy.json
