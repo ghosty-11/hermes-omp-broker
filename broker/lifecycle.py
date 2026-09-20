@@ -6,10 +6,25 @@ import json
 import os
 import secrets
 import signal
+import sys
 import tempfile
 import stat
 import time
+from pathlib import Path
 from typing import Any
+
+_LOADED_SOURCE_PATH = os.path.abspath(__file__)
+_LOADED_SOURCE_BYTES: bytes | None = None
+_LOADED_SOURCE_VERIFIED = False
+try:
+    _LOADED_SOURCE_BYTES = Path(_LOADED_SOURCE_PATH).read_bytes()
+    # A timestamp-valid .pyc may execute older code than the source on disk.
+    # Compare without re-executing or replacing any module/class identity.
+    _LOADED_SOURCE_VERIFIED = sys._getframe().f_code == compile(
+        _LOADED_SOURCE_BYTES, __file__, "exec",
+        dont_inherit=True, optimize=sys.flags.optimize)
+except (OSError, SyntaxError, ValueError):
+    pass
 
 TERMINAL = {"completed", "failed", "rejected", "cancelled", "timed_out", "orphaned", "delivery_failed"}
 
@@ -433,6 +448,150 @@ class LeaseStore:
 
 
 
+def process_snapshot(pid: int) -> dict[str, Any]:
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("invalid process identifier")
+    path = Path("/proc") / str(pid)
+    fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+    return {"pid": pid, "ppid": int(fields[1]), "pgid": int(fields[2]),
+            "sid": int(fields[3]), "start_ticks": int(fields[19]),
+            "uid": path.stat().st_uid, "state": fields[0],
+            "cpu_ticks": int(fields[11]) + int(fields[12])}
+
+
+def capture_process_identity(pid: int) -> dict[str, Any]:
+    child = process_snapshot(pid)
+    broker = process_snapshot(os.getpid())
+    if child["ppid"] != broker["pid"] or child["pgid"] != pid or child["sid"] != pid:
+        raise ValueError("process is not a new broker-owned session")
+    fields = ("pid", "ppid", "pgid", "sid", "start_ticks", "uid")
+    return {**{key: child[key] for key in fields},
+            "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            "broker": {key: broker[key] for key in ("pid", "start_ticks", "uid")}}
+
+
+def process_identity_matches(identity: object, broker_pid: int) -> bool:
+    try:
+        if not isinstance(identity, dict) or type(broker_pid) is not int or broker_pid <= 0:
+            return False
+        fields = ("pid", "ppid", "pgid", "sid", "start_ticks", "uid")
+        if any(type(identity.get(key)) is not int for key in fields):
+            return False
+        broker = identity["broker"]
+        if not isinstance(broker, dict) or any(
+                type(broker.get(key)) is not int for key in ("pid", "start_ticks", "uid")):
+            return False
+        actual = process_snapshot(identity["pid"])
+        parent = process_snapshot(broker_pid)
+        return (
+            identity["boot_id"] == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            and all(actual[key] == identity[key] for key in fields)
+            and actual["state"] not in {"Z", "X"}
+            and actual["ppid"] == broker_pid == broker["pid"]
+            and actual["pgid"] == actual["sid"] == actual["pid"]
+            and all(parent[key] == broker[key] for key in ("pid", "start_ticks", "uid"))
+            and parent["state"] not in {"Z", "X"}
+        )
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return False
+
+
+def terminate_process_tree(identity: dict[str, Any], *, authorize) -> bool:
+    """Freeze and stop only birth-checked pidfds, including detached descendants.
+
+    Freezing each ancestor before discovering its children closes the fork race.
+    No process-group signal is used: a group number is not a process capability.
+    """
+    if not process_identity_matches(identity, identity.get("broker", {}).get("pid")):
+        return False
+    held: dict[int, tuple[int, dict[str, Any]]] = {}
+    stopped: set[int] = set()
+    completed = False
+    try:
+        pending = [process_snapshot(identity["pid"])]
+        while pending:
+            for snapshot in pending:
+                if len(held) >= 4096 or not authorize():
+                    return False
+                pid = snapshot["pid"]
+                fd = os.pidfd_open(pid)
+                try:
+                    current = process_snapshot(pid)
+                    if any(current[key] != snapshot[key] for key in
+                           ("pid", "start_ticks", "ppid", "pgid", "sid", "uid")):
+                        return False
+                    held[pid] = (fd, snapshot)
+                    fd = -1
+                    if current["state"] not in {"Z", "X"}:
+                        if not authorize():
+                            return False
+                        signal.pidfd_send_signal(held[pid][0], signal.SIGSTOP)
+                        stopped.add(pid)
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+            # Wait for stops to take effect before the next descendant census.
+            deadline = time.monotonic() + 2
+            while True:
+                moving = []
+                for pid in stopped:
+                    try:
+                        if process_snapshot(pid)["state"] not in {"T", "t", "Z", "X"}:
+                            moving.append(pid)
+                    except FileNotFoundError:
+                        pass
+                if not moving:
+                    break
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.01)
+            pending = []
+            for path in Path("/proc").iterdir():
+                if not path.name.isdigit() or int(path.name) in held:
+                    continue
+                try:
+                    child = process_snapshot(int(path.name))
+                except (OSError, ValueError, IndexError):
+                    continue
+                if child["ppid"] in held and child["state"] not in {"Z", "X"}:
+                    pending.append(child)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid, (fd, _snapshot) in reversed(list(held.items())):
+                if not authorize():
+                    return False
+                try:
+                    signal.pidfd_send_signal(fd, sig)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            alive = False
+            for pid, (_fd, snapshot) in held.items():
+                try:
+                    current = process_snapshot(pid)
+                    if (current["start_ticks"] == snapshot["start_ticks"]
+                            and current["state"] not in {"Z", "X"}):
+                        alive = True
+                except FileNotFoundError:
+                    pass
+            if not alive:
+                completed = True
+                return True
+            time.sleep(0.02)
+        return False
+    except (OSError, ValueError, KeyError, IndexError):
+        return False
+    finally:
+        for pid, (fd, snapshot) in held.items():
+            if not completed and pid in stopped and snapshot["state"] not in {"T", "t"}:
+                # Undo our own temporary stop on a withdrawn authorization.
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+            os.close(fd)
+
+
 class JobStore:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -453,6 +612,11 @@ class JobStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_name, path)
+            directory_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             try:
                 os.close(fd)
@@ -476,8 +640,8 @@ class JobStore:
         now = int(time.time())
         self._write({"version": 1, "request_id": request_id, "task_id": task_id,
                      "repository": repository, "caller": caller, "status": "pending",
-                     "process_group": None, "result": None, "created_at": now,
-                     "updated_at": now})
+                     "process_group": None, "process": None, "process_history": [],
+                     "result": None, "created_at": now, "updated_at": now})
 
     def arm_reexecution(
         self, request_id: str, *, task_id: str, repository: str, caller: str,
@@ -497,6 +661,7 @@ class JobStore:
                  or (isinstance(result, dict) and result.get("final") is None)))
         if (
             record.get("reexecuted")
+            or record.get("launch_uncertain")
             or (has_outcome and not cancellation)
             or status not in {"pending", "orphaned", "cancelled"}
             or record.get("process_group") is not None
@@ -513,14 +678,30 @@ class JobStore:
                     process_group: int | None = None,
                     result: dict[str, Any] | None = None) -> None:
         record = self.get(request_id)
+        if status in TERMINAL and record.get("process") is not None:
+            record.setdefault("process_history", []).append({
+                "identity": record["process"], "status": status,
+                "retired_at": int(time.time())})
+            record["process"] = None
+            if status == "orphaned":
+                record["launch_uncertain"] = True
         record.update(status=status, process_group=process_group,
                       updated_at=int(time.time()))
         if result is not None:
             record["result"] = result
         self._write(record)
 
+    def launching(self, request_id: str) -> None:
+        record = self.get(request_id)
+        record.update(launch_uncertain=True, updated_at=int(time.time()))
+        self._write(record)
+
     def running(self, request_id: str, *, process_group: int) -> None:
-        self._transition(request_id, "running", process_group=process_group)
+        record = self.get(request_id)
+        identity = capture_process_identity(process_group)
+        record.update(status="running", process_group=process_group, process=identity,
+                      launch_uncertain=False, updated_at=int(time.time()))
+        self._write(record)
 
     def finish(self, request_id: str, status: str, result: dict[str, Any]) -> None:
         if status not in TERMINAL:
@@ -539,11 +720,11 @@ class JobStore:
 
     def cancel(self, request_id: str) -> bool:
         record = self.get(request_id)
-        if record.get("status") != "running" or not isinstance(record.get("process_group"), int):
+        identity = record.get("process")
+        if record.get("status") != "running" or not process_identity_matches(identity, os.getpid()):
             return False
-        try:
-            os.killpg(record["process_group"], signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        if not terminate_process_tree(identity, authorize=lambda: self.get(request_id) == record):
+            return False
         self._transition(request_id, "cancelled", result=record.get("result"))
         return True
+

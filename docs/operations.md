@@ -5,39 +5,58 @@
 Start the socket before admitting the Hermes tool. Verify the caller sees only the socket
 and cannot read coding credentials, policy, environment, audit, or job state.
 
+These commands apply to generic protocol-v1 user-unit deployments. Protocol-v2
+deployments use their owner's named endpoint units. Never activate the generic
+protocol-v1 units as a fallback for a protocol-v2 deployment. Source equality
+does not prove that a release is installed or loaded.
+
 ```sh
 systemctl --user status omp-delegate-broker.socket
+```
+
+```sh
 systemctl --user status omp-delegate-broker.service
+```
+
+```sh
 journalctl --user-unit omp-delegate-broker.service --since today
 ```
 
 For each request, correlate the request ID with its existing task ID, policy decision,
-durable job record, process group, typed final, Git evidence, verification exits, cleanup,
-and bounded redacted output. A model summary or `MET` verdict is not broker evidence.
-At startup, the broker captures the policy and script bytes that it loaded and writes an
-atomic policy-pair stamp in its writable agent directory. The stamp records the loaded-byte
-digest and process identity; it does not reread a later policy file. Importing the module
-does not write a stamp, and a reporting failure is fail-soft. Boundary freshness compares
-the running stamp with the deployed pair.
+durable job record, captured process birth identity, typed final, Git evidence,
+verification exits, cleanup, and bounded redacted output. A model summary or `MET`
+verdict is not broker evidence. At startup, `main()` writes an atomic stamp in the
+writable agent directory from the three artifacts actually loaded into the process:
+policy bytes, broker script bytes, and lifecycle source bytes. The stamp records
+each loaded path and SHA-256, the policy-pair digest of the script and policy bytes
+used for that field, and process identity (`pid` and `start_monotonic_usec`). It
+does not reread later files on disk. Importing the module does not write a stamp,
+and a reporting failure is fail-soft. Boundary freshness compares those captured
+loaded bytes and process identity with the deployed artifacts; a matching pair
+digest alone is not a complete stamp.
 
 ## Cancellation, timeout, and restart
 
-Cancellation and timeout must terminate descendants and wait for process-group clearance.
-Preserve dirty repository evidence. On service restart, the broker classifies persisted
-`pending` and `running` records as `orphaned` before admitting new work; it does not resume
-or clean their checkouts automatically. A completed result whose socket delivery fails is
-retained as `delivery_failed` for operator retrieval from the private job store. Terminal
-results remain durable across launcher retries and model repinning; a launcher must replay
-the validated result rather than dispatching a replacement job.
+Cancellation and timeout must terminate confirmed descendants of the recorded
+process birth identity and wait for clearance. Do not guess ownership from a
+parent PID. Preserve dirty repository evidence. On service restart, the broker
+classifies persisted `pending` and `running` records as `orphaned` before
+admitting new work; it does not resume or clean their checkouts automatically. A
+completed result whose socket delivery fails is retained as `delivery_failed` for
+operator retrieval from the private job store. Terminal results remain durable
+across launcher retries and model repinning; a launcher must replay the validated
+result rather than dispatching a replacement job.
 
-Do not delete an orphan or retry against the same checkout until the operator has inspected
-the repository, process tree, job record, and audit entry. A deterministic cancellation
-control should confirm the recorded process group is gone before cleanup.
+Do not delete an orphan or retry against the same checkout until the operator has
+inspected the repository, process tree, job record, and audit entry. A
+deterministic cancellation control joins the exact task ID, request ID, and
+captured process birth identity, then terminates only birth-checked descendants.
+It must confirm those processes are gone before cleanup.
 
-The signal handler terminates an active child process group before it exits. `SIGTERM`
-therefore produces exit status `143` (`128 + 15`). Treat `143` as an intentional service
-termination only when the service manager or operator sent `SIGTERM`; the persisted job and
-process-group evidence remains authoritative.
+The service `SIGTERM` handler terminates an active child process group before it
+exits and therefore produces exit status `143` (`128 + 15`). Treat `143` as an
+intentional service termination only when the service manager or operator sent
+`SIGTERM`; the persisted job and process-birth evidence remains authoritative.
 
 ## Protocol v2 source staging
 
@@ -133,11 +152,21 @@ request.
 ## Upgrade
 
 1. Disable `delegate_to_omp` on every Hermes profile that can call it.
-2. Stop the socket and service; confirm no broker-owned process group remains.
+2. Stop the socket and service; confirm no broker-owned process birth identity remains.
 3. Back up installed package bytes, policy, environment, audit, and job records outside the
    install paths.
 4. Install the new pinned client, broker, extension, plugin, skill, and units.
-5. Run `systemctl --user daemon-reload`, enable the socket, and run the deterministic suite.
+5. For a generic protocol-v1 user-unit deployment, reload systemd and enable the socket,
+   then run the deterministic suite. Protocol-v2 operators use their deployment owner's
+   named endpoint units and must not enable the generic v1 socket as a fallback.
+
+```sh
+systemctl --user daemon-reload
+```
+
+```sh
+systemctl --user enable --now omp-delegate-broker.socket
+```
 6. Exercise unknown-key denial, one read-only job, one write job, descendant cancellation,
    timeout, restart/orphan classification, and retained-result retrieval in a disposable
    repository.
@@ -151,11 +180,18 @@ A policy that admits `backlog-maturation-research` or uses the exact
 `replay_safe_models` replay contract is not compatible with a broker or extension from
 before those fields. Restore the matching policy with the matching bytes; do not leave a
 research caller pointed at an older extension. Do not roll job state backward over newer
-records; retain the pre-rollback copy for reconciliation.
+records; retain the pre-rollback copy for reconciliation. The following commands are
+generic protocol-v1 user-unit examples, not a live v2 rollback.
 
 ```sh
 systemctl --user daemon-reload
+```
+
+```sh
 systemctl --user enable --now omp-delegate-broker.socket
+```
+
+```sh
 systemctl --user status omp-delegate-broker.socket
 ```
 

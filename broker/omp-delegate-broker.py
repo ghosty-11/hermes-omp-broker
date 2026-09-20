@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import pwd
+import queue
 import select
 import signal
 import socket
@@ -26,9 +27,13 @@ from pathlib import Path
 from typing import Mapping
 
 try:
-    from broker.lifecycle import JobStore, LeaseStore, LeaseUnavailable
+    from broker import lifecycle as _lifecycle
 except ModuleNotFoundError:
-    from lifecycle import JobStore, LeaseStore, LeaseUnavailable
+    import lifecycle as _lifecycle
+
+JobStore = _lifecycle.JobStore
+LeaseStore = _lifecycle.LeaseStore
+LeaseUnavailable = _lifecycle.LeaseUnavailable
 
 
 POLICY_FILE = Path(os.environ.get("HERMES_OMP_POLICY", "policy.json"))
@@ -46,6 +51,8 @@ MAX_PROMPT_CHARS = 500_000
 MAX_TIMEOUT = 810.0
 ABSOLUTE_MAX_TIMEOUT = 3600.0
 FRAME_TIMEOUT = 5.0
+MAX_CONTROL_CONNECTIONS = 8
+MAX_WAITING_EXECUTIONS = 16
 JOB_STORE = JobStore(Path(os.environ.get("HERMES_OMP_JOB_DIR", "state/jobs")))
 
 
@@ -84,10 +91,16 @@ def write_policy_stamp(
     script_is_loaded = script_file is None
     policy_is_loaded = policy_file is None
     script_path = Path(script_file if script_file is not None else _LOADED_SCRIPT_PATH)
-    policy_path = Path(policy_file if policy_file is not None else POLICY_FILE)
+    policy_path = Path(policy_file if policy_file is not None else _LOADED_POLICY_PATH)
     script_path = Path(os.path.abspath(script_path))
     policy_path = Path(os.path.abspath(policy_path))
     try:
+        if (
+            not _LOADED_SCRIPT_VERIFIED
+            or not getattr(_lifecycle, "_LOADED_SOURCE_VERIFIED", False)
+            or _LOADED_POLICY_BYTES is None
+        ):
+            raise OSError("loaded artifact provenance is unavailable")
         if script_bytes is None:
             script_bytes = _LOADED_SCRIPT_BYTES if script_is_loaded else script_path.read_bytes()
         if policy_bytes is None:
@@ -104,6 +117,20 @@ def write_policy_stamp(
         "policy_file": str(policy_path),
         "script_file": str(script_path),
         "policy_pair_digest": policy_pair_digest(script_bytes, policy_bytes),
+        "loaded_artifacts": {
+            "script": {
+                "path": str(_LOADED_SCRIPT_PATH),
+                "sha256": "sha256:" + hashlib.sha256(_LOADED_SCRIPT_BYTES).hexdigest(),
+            },
+            "policy": {
+                "path": str(_LOADED_POLICY_PATH),
+                "sha256": "sha256:" + hashlib.sha256(_LOADED_POLICY_BYTES).hexdigest(),
+            },
+            "lifecycle": {
+                "path": _lifecycle._LOADED_SOURCE_PATH,
+                "sha256": "sha256:" + hashlib.sha256(_lifecycle._LOADED_SOURCE_BYTES).hexdigest(),
+            },
+        },
         "written_at": datetime.datetime.now(datetime.timezone.utc)
                       .isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
@@ -208,18 +235,23 @@ _ACTIVE_PROCESS_GROUP: int | None = None
 _LOADED_POLICY_BYTES: bytes | None = None
 _LOADED_SCRIPT_BYTES: bytes | None = None
 _LOADED_SCRIPT_PATH = Path(os.path.abspath(__file__))
+_LOADED_POLICY_PATH = Path(os.path.abspath(POLICY_FILE))
+_LOADED_SCRIPT_VERIFIED = False
+try:
+    _LOADED_SCRIPT_BYTES = _LOADED_SCRIPT_PATH.read_bytes()
+    _LOADED_SCRIPT_VERIFIED = sys._getframe().f_code == compile(
+        _LOADED_SCRIPT_BYTES, __file__, "exec",
+        dont_inherit=True, optimize=sys.flags.optimize)
+except (OSError, SyntaxError, ValueError):
+    pass
 
 def _load_policy() -> tuple[
     dict[str, set[Path]], dict[str, str], dict[str, Path],
     dict[str, dict[str, object]], frozenset[str] | None,
 ]:
-    global _LOADED_POLICY_BYTES, _LOADED_SCRIPT_BYTES
+    global _LOADED_POLICY_BYTES
     try:
         _LOADED_POLICY_BYTES = POLICY_FILE.read_bytes()
-        try:
-            _LOADED_SCRIPT_BYTES = _LOADED_SCRIPT_PATH.read_bytes()
-        except OSError:
-            _LOADED_SCRIPT_BYTES = None
         value = json.loads(_LOADED_POLICY_BYTES)
         repositories = value.get("repositories", {})
         repository_paths = {
@@ -359,6 +391,13 @@ class ListenerEndpoint:
 class HealthRequest:
     endpoint: str
     peer_uid: int
+
+
+@dataclasses.dataclass(frozen=True)
+class DeferredExecution:
+    value: dict[str, object]
+    peer_uid: int
+    endpoint: str
 
 def git_common_dir(path: Path) -> Path | None:
     """The shared .git of a checkout or worktree, or None if it is not git."""
@@ -1202,6 +1241,8 @@ def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
             f"broker execution fault: {type(exc).__name__}: {exc}",
             request_id=request_id, version=request.protocol_version,
         )
+        # An exception is not proof of clearance, even when cleanup was attempted.
+        response["process_group_clear"] = False
         try:
             # Never demote an already-terminal job (a fault after a
             # successful finish must not overwrite completed with failed).
@@ -1245,6 +1286,9 @@ def _run_request_inner(request: Request, conn: socket.socket) -> dict[str, objec
     try:
         with tempfile.TemporaryDirectory(prefix="omp-delegate-broker-") as td:
             final_path = Path(td) / "final.json"
+            # Persist uncertainty before spawning. A failed birth-record write
+            # must never turn consumed work into a replayable pending job.
+            JOB_STORE.launching(request_id)
             try:
                 process = start_omp_process(request, final_path, provider_api_keys)
             except OSError as exc:
@@ -1259,8 +1303,25 @@ def _run_request_inner(request: Request, conn: socket.socket) -> dict[str, objec
                 JOB_STORE.finish(request_id, "failed", response)
                 return response
 
-            JOB_STORE.running(request_id, process_group=process.pid)
             _ACTIVE_PROCESS_GROUP = process.pid
+            try:
+                JOB_STORE.running(request_id, process_group=process.pid)
+            except BaseException:
+                try:
+                    identity = _lifecycle.capture_process_identity(process.pid)
+                    cleared = _lifecycle.terminate_process_tree(
+                        identity, authorize=lambda: True)
+                except (OSError, ValueError, IndexError):
+                    cleared = False
+                if not cleared:
+                    # This Popen has not been reaped: its new session ID cannot
+                    # have been recycled. Never leave anonymous launched work.
+                    _kill_process_group(process.pid)
+                process.wait()
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+                raise
             stop_watcher = threading.Event()
             disconnected = threading.Event()
             watcher = threading.Thread(
@@ -1371,7 +1432,8 @@ def _send_frame(conn: socket.socket, value: dict[str, object]) -> None:
 
 def receive_request(
     conn: socket.socket, *, endpoint: str | None = None, allow_v1: bool = True,
-) -> Request | StatusRequest | HealthRequest:
+    defer_execution: bool = False,
+) -> Request | StatusRequest | HealthRequest | DeferredExecution:
     deadline = time.monotonic() + FRAME_TIMEOUT
     size = struct.unpack("!I", _recv_exact(conn, 4, deadline))[0]
     if size <= 0 or size > MAX_REQUEST_BYTES:
@@ -1390,7 +1452,23 @@ def receive_request(
         )
         raise ProtocolError(
             "job unavailable", version=2, operation=operation)
-    request = parse_request(value, peer_uid=_peer_uid(conn), endpoint=endpoint)
+    peer_uid = _peer_uid(conn)
+    if defer_execution and isinstance(value, dict) and value.get("op") == "execute":
+        # Authenticate and bound the envelope before queueing. Lease validation
+        # and consumption stay together on the single execution thread.
+        if (
+            set(value) != V2_REQUEST_FIELDS
+            or value.get("version") != 2
+            or not isinstance(value.get("lease_id"), str)
+            or not value["lease_id"]
+            or not endpoint
+            or endpoint not in LEASE_STORES
+            or ENDPOINT_UIDS.get(endpoint) != peer_uid
+        ):
+            raise ProtocolError("job unavailable", version=2)
+        conn.settimeout(None)
+        return DeferredExecution(value, peer_uid, endpoint)
+    request = parse_request(value, peer_uid=peer_uid, endpoint=endpoint)
     if (
         not allow_v1
         and not isinstance(request, HealthRequest)
@@ -1403,12 +1481,25 @@ def receive_request(
 
 def _serve_connection(
     conn: socket.socket, *, endpoint: str | None, allow_v1: bool,
-) -> None:
+    enqueue=None, deferred: DeferredExecution | None = None,
+) -> bool:
+    """Return true only when ownership of the connection moved to the queue."""
     request_id = ""
     invocation = False
     try:
-        request = receive_request(
-            conn, endpoint=endpoint, allow_v1=allow_v1)
+        if deferred is not None:
+            request = parse_request(
+                deferred.value, peer_uid=deferred.peer_uid, endpoint=deferred.endpoint)
+        else:
+            request = receive_request(
+                conn, endpoint=endpoint, allow_v1=allow_v1,
+                defer_execution=enqueue is not None)
+        if isinstance(request, DeferredExecution):
+            try:
+                enqueue(conn, request)
+            except queue.Full:
+                raise ProtocolError("job unavailable", version=2) from None
+            return True
         if isinstance(request, HealthRequest):
             response = read_health(request)
         else:
@@ -1446,6 +1537,7 @@ def _serve_connection(
                 JOB_STORE.delivery_failed(request_id)
             except (OSError, ValueError):
                 pass
+    return False
 
 
 def serve(listener: socket.socket) -> None:
@@ -1483,21 +1575,98 @@ def systemd_listeners() -> list[ListenerEndpoint]:
 
 
 def serve_named(listeners: list[ListenerEndpoint]) -> None:
-    """Serially serve every named authority endpoint in one global-lock process."""
+    """Serve bounded controls concurrently; admit and execute only on this thread."""
     by_fd = {item.socket.fileno(): item for item in listeners}
-    # Recover at startup, unconditionally. Gating this on the first EXECUTE
-    # deadlocked a stuck job on 2026-08-26: a status-only lane can never
-    # trigger an execute, so its zombie could never be recovered.
+    # Recovery precedes both controls and admissions, including status-only lanes.
     JOB_STORE.recover_orphans()
-    while True:
-        readable, _, _ = select.select(
-            [item.socket for item in listeners], [], [])
-        for listener in readable:
-            endpoint = by_fd[listener.fileno()]
-            conn, _ = listener.accept()
+    executions = queue.Queue(maxsize=MAX_WAITING_EXECUTIONS)
+    control_slots = threading.BoundedSemaphore(MAX_CONTROL_CONNECTIONS)
+    stopping = threading.Event()
+    connection_lock = threading.Lock()
+    control_connections: set[socket.socket] = set()
+    failures: list[BaseException] = []
+
+    def enqueue(conn: socket.socket, request: DeferredExecution) -> None:
+        with connection_lock:
+            if stopping.is_set():
+                raise queue.Full
+            executions.put_nowait((conn, request))
+
+    def control(conn: socket.socket, endpoint: str) -> None:
+        transferred = False
+        try:
+            transferred = _serve_connection(
+                conn, endpoint=endpoint, allow_v1=False, enqueue=enqueue)
+        finally:
+            with connection_lock:
+                control_connections.discard(conn)
+            if not transferred:
+                conn.close()
+            control_slots.release()
+
+    def dispatch() -> None:
+        try:
+            while not stopping.is_set():
+                readable, _, _ = select.select(
+                    [item.socket for item in listeners], [], [], 0.1)
+                for listener in readable:
+                    conn, _ = listener.accept()
+                    if not control_slots.acquire(blocking=False):
+                        # Transport refusal, before parsing or consuming a lease.
+                        conn.close()
+                        continue
+                    with connection_lock:
+                        control_connections.add(conn)
+                    try:
+                        threading.Thread(
+                            target=control, args=(conn, by_fd[listener.fileno()].endpoint),
+                            name="omp-control", daemon=True,
+                        ).start()
+                    except BaseException:
+                        with connection_lock:
+                            control_connections.discard(conn)
+                        conn.close()
+                        control_slots.release()
+                        raise
+        except BaseException as exc:
+            failures.append(exc)
+            stopping.set()
+
+    dispatcher = threading.Thread(target=dispatch, name="omp-dispatch", daemon=True)
+    dispatcher.start()
+    try:
+        while not stopping.is_set():
+            try:
+                conn, request = executions.get(timeout=0.1)
+            except queue.Empty:
+                continue
             with conn:
+                # A queued client that went away must not spend a lease. A
+                # write-half shutdown is not a disconnect in the framed protocol.
+                poller = select.poll()
+                poller.register(conn, select.POLLHUP | select.POLLERR | select.POLLNVAL)
+                if poller.poll(0):
+                    continue
                 _serve_connection(
-                    conn, endpoint=endpoint.endpoint, allow_v1=False)
+                    conn, endpoint=request.endpoint, allow_v1=False, deferred=request)
+        if failures:
+            raise failures[0]
+    finally:
+        with connection_lock:
+            stopping.set()
+        dispatcher.join()
+        with connection_lock:
+            for conn in control_connections:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            while True:
+                try:
+                    conn, _ = executions.get_nowait()
+                except queue.Empty:
+                    break
+                conn.close()
 
 
 def _terminate(signum: int, _frame: object) -> None:

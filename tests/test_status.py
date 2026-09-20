@@ -10,6 +10,7 @@ import os
 import socket
 import struct
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -258,7 +259,16 @@ class StatusServerProtocolTest(unittest.TestCase):
         self.module.JOB_STORE.create(
             "running", task_id="task-running", repository="repo", caller="planner",
         )
-        self.module.JOB_STORE.running("running", process_group=4321)
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+            stdin=subprocess.PIPE, start_new_session=True)
+        def cleanup():
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+            child.stdin.close()
+        self.addCleanup(cleanup)
+        self.module.JOB_STORE.running("running", process_group=child.pid)
 
         for request_id, status in (("pending", "pending"), ("running", "running")):
             with self.subTest(status=status):

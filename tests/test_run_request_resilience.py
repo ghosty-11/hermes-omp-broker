@@ -8,6 +8,7 @@ import os
 import socket
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -141,13 +142,13 @@ class MaskingDiagnosticTests(ResilienceHarness):
     """The wire uses explicit v2 admission errors, while the journal carries
     the true failure reason for operator diagnosis."""
 
-    def _exchange(self, module, raw_payload: bytes) -> tuple[dict, str]:
+    def _exchange(self, module, raw_payload: bytes, **kwargs) -> tuple[dict, str]:
         client, server = socket.socketpair()
         client.sendall(len(raw_payload).to_bytes(4, "big") + raw_payload)
         client.shutdown(socket.SHUT_WR)
         with contextlib.redirect_stderr(io.StringIO()) as err:
             module._serve_connection(server, endpoint="backlog-test",
-                                     allow_v1=False)
+                                     allow_v1=False, **kwargs)
         head = client.recv(4)
         body = client.recv(int.from_bytes(head, "big"))
         client.close()
@@ -209,6 +210,38 @@ class MaskingDiagnosticTests(ResilienceHarness):
                 {"version": 2, "op": "execute", "ok": False,
                  "error": "job unavailable"}, response)
             self.assertIn("LeaseUnavailable", err)
+
+    def test_full_execution_queue_refuses_without_spending_the_lease(self):
+        with tempfile.TemporaryDirectory() as raw:
+            td = Path(raw)
+            module, request = self._load(td)
+            store = module.LEASE_STORES["backlog-test"]
+            fixed = {
+                name: getattr(request, name)
+                for name in module.REQUEST_FIELDS - {"version"}
+            }
+            fixed["workspace"] = str(request.workspace)
+            lease = store.issue(
+                fixed_request=fixed, endpoint="backlog-test", peer_uid=os.getuid(),
+                artifact_digest="sha256:fixture", policy_version="fixture",
+                template_version="fixture", expires_at=int(time.time()) + 60)
+            payload = {"version": 2, "op": "execute", "lease_id": lease}
+            waiting = module.queue.Queue(maxsize=1)
+            waiting.put_nowait(None)
+
+            def enqueue(conn, deferred):
+                waiting.put_nowait((conn, deferred))
+
+            response, _ = self._exchange(
+                module, json.dumps(payload).encode(), enqueue=enqueue)
+            self.assertEqual(
+                {"version": 2, "op": "execute", "ok": False, "error": "job unavailable"},
+                response)
+            admitted = module.parse_request(
+                payload, endpoint="backlog-test", peer_uid=os.getuid())
+            self.assertEqual(request.request_id, admitted.request_id)
+            with self.assertRaises(module.ProtocolError):
+                module.parse_request(payload, endpoint="backlog-test", peer_uid=os.getuid())
 
 
 class StartupRecoveryTests(ResilienceHarness):

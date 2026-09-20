@@ -17,7 +17,9 @@ BROKER = ROOT / "broker/omp-delegate-broker.py"
 
 def _load_broker(env: dict[str, str]) -> type[object]:
     """Import the broker module with the given env overrides."""
-    with mock.patch.dict(os.environ, env, clear=True):
+    with tempfile.TemporaryDirectory() as jobs, mock.patch.dict(
+        os.environ, {"HERMES_OMP_JOB_DIR": jobs, **env}, clear=True,
+    ):
         spec = importlib.util.spec_from_file_location(
             f"broker_stamp_{os.urandom(4).hex()}", BROKER)
         assert spec and spec.loader
@@ -96,8 +98,9 @@ class PolicyStampWritePathTest(unittest.TestCase):
             broker_mod = _load_broker(env)
             # main() writes the stamp then hits systemd_listeners which
             # raises SystemExit because LISTEN_PID != os.getpid().
-            with self.assertRaises(SystemExit):
-                broker_mod.main()
+            with mock.patch.object(broker_mod.signal, "signal"):
+                with self.assertRaises(SystemExit):
+                    broker_mod.main()
             self.assertTrue(stamp_path.exists())
     def test_main_uses_policy_bytes_captured_at_load(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -113,8 +116,9 @@ class PolicyStampWritePathTest(unittest.TestCase):
                 "HERMES_OMP_JOB_DIR": str(root / "jobs"),
             })
             policy.write_bytes(second)
-            with mock.patch.object(
-                broker_mod, "systemd_listeners", side_effect=SystemExit,
+            with (
+                mock.patch.object(broker_mod, "systemd_listeners", side_effect=SystemExit),
+                mock.patch.object(broker_mod.signal, "signal"),
             ):
                 with self.assertRaises(SystemExit):
                     broker_mod.main()
@@ -123,6 +127,12 @@ class PolicyStampWritePathTest(unittest.TestCase):
                 _compute_expected_digest(broker_mod._LOADED_SCRIPT_BYTES, first),
                 stamp["policy_pair_digest"],
             )
+            self.assertEqual(
+                {"path": str(policy), "sha256": "sha256:" + hashlib.sha256(first).hexdigest()},
+                stamp["loaded_artifacts"]["policy"],
+            )
+            self.assertEqual(stamp["loaded_artifacts"],
+                             broker_mod.write_policy_stamp()["loaded_artifacts"])
 
     def test_invalid_loaded_policy_does_not_produce_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -135,107 +145,48 @@ class PolicyStampWritePathTest(unittest.TestCase):
                 "HERMES_OMP_POLICY_STAMP": str(stamp_path),
                 "HERMES_OMP_JOB_DIR": str(root / "jobs"),
             })
-            with mock.patch.object(
-                broker_mod, "systemd_listeners", side_effect=SystemExit,
+            with (
+                mock.patch.object(broker_mod, "systemd_listeners", side_effect=SystemExit),
+                mock.patch.object(broker_mod.signal, "signal"),
             ):
                 with self.assertRaises(SystemExit):
                     broker_mod.main()
             self.assertFalse(stamp_path.exists())
 
-    def test_unwritable_stamp_path_prints_diagnostic(self) -> None:
-        """An absolute-readonly directory does not raise — just stderr."""
-        broker_mod = _load_broker({"HERMES_OMP_POLICY": "/dev/null"})
-        import io
-        import contextlib
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            # /proc/sys is typically root-only; on CI it might be writable.
-            # Fallback: a nonexistent absolute path is writable (no mkdir
-            # parent fails), so we create a non-writable directory and point
-            # the stamp inside it.
-            td = tempfile.mkdtemp()
-            try:
-                stamp_dir = Path(td) / "noperm"
-                stamp_dir.mkdir(mode=0o000)
-                stamp_file = stamp_dir / "broker-policy.json"
-                stamp_path = str(stamp_file)
-                result = broker_mod.write_policy_stamp(
-                    script_file="/some/script.py",
-                    policy_file="/some/policy.json",
-                    stamp_file=Path(stamp_path),
-                )
-                # Either returns None (failed soft) or we check stderr.
-                # The key assertion: no exception was raised.
-                stderr_output = buf.getvalue()
-                self.assertIn("omp-delegate-broker", stderr_output)
-            finally:
-                # Restore mode so cleanup can remove it.
-                import stat
-                try:
-                    stamp_dir.chmod(0o755)
-                except OSError:
-                    pass
-
-
-class PolicyStampFieldTest(unittest.TestCase):
-    """The stamp contains all required fields with correct types."""
-
-    def test_stamp_fields_and_types(self) -> None:
-        """Every required field present; types match contract."""
+    def test_failed_stamp_replacement_preserves_previous_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            td_path = Path(td)
-            script = td_path / "script.py"
-            policy = td_path / "policy.json"
-            script.write_bytes(b"#!/usr/bin/env python3\n")
-            policy.write_text(json.dumps({"repositories": {}}))
+            root = Path(td)
+            policy = root / "policy.json"
+            policy.write_text('{"repositories": {}}')
+            stamp_path = root / "stamp.json"
+            broker_mod = _load_broker({
+                "HERMES_OMP_POLICY": str(policy),
+                "HERMES_OMP_POLICY_STAMP": str(stamp_path),
+            })
+            first = broker_mod.write_policy_stamp()
+            self.assertIsNotNone(first)
+            previous = stamp_path.read_bytes()
+            with mock.patch.object(broker_mod.os, "replace", side_effect=PermissionError):
+                self.assertIsNone(broker_mod.write_policy_stamp())
+            self.assertEqual(previous, stamp_path.read_bytes())
 
+
+class LoadedArtifactTest(unittest.TestCase):
+    def test_pair_overrides_cannot_relabel_loaded_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            policy = root / "policy.json"
+            policy.write_text('{"repositories": {}}')
             broker_mod = _load_broker({"HERMES_OMP_POLICY": str(policy)})
-            stamp = broker_mod.write_policy_stamp(
-                script_file=str(script),
-                policy_file=str(policy),
-                stamp_file=Path(td) / "broker-policy.json",
+            first = broker_mod.write_policy_stamp(stamp_file=root / "first.json")
+            changed = broker_mod.write_policy_stamp(
+                script_file=str(root / "other.py"), script_bytes=b"other script",
+                policy_file=str(root / "other.json"), policy_bytes=b"other policy",
+                stamp_file=root / "second.json",
             )
-
-        self.assertIsNotNone(stamp)
-        self.assertIsInstance(stamp["pid"], int)
-        self.assertGreater(stamp["pid"], 0)
-        self.assertEqual(stamp["pid"], os.getpid())
-        self.assertIsInstance(stamp["start_monotonic_usec"], int)
-        self.assertGreater(stamp["start_monotonic_usec"], 0)
-        self.assertEqual(stamp["script_file"], str(script))
-        self.assertEqual(stamp["policy_file"], str(policy))
-        self.assertIsInstance(stamp["policy_pair_digest"], str)
-        self.assertTrue(stamp["policy_pair_digest"].startswith("sha256:"))
-        self.assertIsInstance(stamp["written_at"], str)
-        # written_at is ISO8601 — parseable by dateutil or basic check.
-        from datetime import datetime, timezone
-        # Accept Z or +00:00 suffix.
-        ts = stamp["written_at"].replace("Z", "+00:00")
-        datetime.fromisoformat(ts)
+            self.assertNotEqual(first["policy_pair_digest"], changed["policy_pair_digest"])
+            self.assertEqual(first["loaded_artifacts"], changed["loaded_artifacts"])
+            self.assertEqual(str(BROKER), changed["loaded_artifacts"]["script"]["path"])
+            self.assertEqual(str(policy), changed["loaded_artifacts"]["policy"]["path"])
 
 
-class PolicyStampForeignPathTest(unittest.TestCase):
-    """A stamp writer never produces a stamp with foreign paths."""
-
-    def test_stamp_paths_match_input(self) -> None:
-        """Paths in the stamp equal exactly what we passed in."""
-        with tempfile.TemporaryDirectory() as td:
-            td_path = Path(td)
-            script = td_path / "script.py"
-            policy = td_path / "policy.json"
-            script.write_bytes(b"#!/usr/bin/env python3\n")
-            policy.write_text(json.dumps({"repositories": {}}))
-
-            # Use distinct paths (with absolute form) and verify the stamp.
-            script_abs = str(script.resolve())
-            policy_abs = str(policy.resolve())
-            broker_mod = _load_broker({"HERMES_OMP_POLICY": policy_abs})
-            stamp = broker_mod.write_policy_stamp(
-                script_file=script_abs,
-                policy_file=policy_abs,
-                stamp_file=td_path / "stamp.json",
-            )
-
-        self.assertIsNotNone(stamp)
-        self.assertEqual(stamp["script_file"], script_abs)
-        self.assertEqual(stamp["policy_file"], policy_abs)

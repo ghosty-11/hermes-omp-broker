@@ -1006,7 +1006,7 @@ class ProtocolV2LeaseTest(unittest.TestCase):
                     store = module.LEASE_STORES["audit"]
                     lease_id = self._issue(module, Path(td) / shape)
                     execute = {"version": 2, "op": "execute", "lease_id": lease_id}
-                    # Attempt 1 spends the lease and dies before any result row.
+                    # Attempt 1 spends the lease but stops before launch is armed.
                     module.parse_request(execute, endpoint="audit", peer_uid=997)
                     module.JOB_STORE.create(
                         "request-1", task_id="task-1", repository="repo",
@@ -1021,20 +1021,21 @@ class ProtocolV2LeaseTest(unittest.TestCase):
                         "verdict": "MET",
                     }
 
-                    def fake_start(_request, final_path, _keys):
-                        Path(final_path).write_text(json.dumps(final))
-                        process = mock.Mock()
-                        process.pid = 4242
-                        process.returncode = 0
-                        process.communicate.return_value = (b"", b"")
+                    children = []
+                    def fixture_start(_request, final_path, _keys):
+                        process = subprocess.Popen(
+                            [sys.executable, "-c",
+                             "import pathlib,sys; sys.stdin.buffer.read(); "
+                             "pathlib.Path(sys.argv[1]).write_text(sys.argv[2])",
+                             str(final_path), json.dumps(final)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, start_new_session=True)
+                        children.append(process)
                         return process
 
                     left, right = socket.socketpair()
                     try:
                         with mock.patch.object(module, "record_audit"), \
-                                mock.patch.object(
-                                    module, "_process_group_exists",
-                                    return_value=False), \
                                 mock.patch.object(
                                     module, "acquire_workspace_lock",
                                     return_value=mock.Mock()), \
@@ -1043,7 +1044,7 @@ class ProtocolV2LeaseTest(unittest.TestCase):
                                     return_value={}), \
                                 mock.patch.object(
                                     module, "start_omp_process",
-                                    side_effect=fake_start):
+                                    side_effect=fixture_start):
                             # Attempt 2: the spent lease re-executes once.
                             request = module.parse_request(
                                 execute, endpoint="audit", peer_uid=997)
@@ -1053,14 +1054,42 @@ class ProtocolV2LeaseTest(unittest.TestCase):
                         self.assertTrue(record["reexecuted"])
                         self.assertEqual("completed", record["status"])
                         self.assertIsNotNone(record["result"])
+                        self.assertEqual(0, children[0].returncode)
+                        self.assertEqual(
+                            children[0].pid,
+                            record["process_history"][0]["identity"]["pid"])
                         # Attempt 3 reports unavailable instead of re-running.
                         with self.assertRaises(module.ProtocolError) as raised:
                             module.parse_request(execute, endpoint="audit", peer_uid=997)
                         self.assertEqual("job unavailable", str(raised.exception))
                         self.assertEqual(1, len(list(store.consumed.glob("*.json"))))
                     finally:
+                        for process in children:
+                            if process.poll() is None:
+                                process.kill()
+                            process.communicate(timeout=5)
                         left.close()
                         right.close()
+
+    def test_consumed_lease_with_uncertain_launch_refuses_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            module = self._load(root)
+            store = module.LEASE_STORES["audit"]
+            lease = self._issue(module, root)
+            execute = {"version": 2, "op": "execute", "lease_id": lease}
+            module.parse_request(execute, endpoint="audit", peer_uid=997)
+            module.JOB_STORE.create(
+                "request-1", task_id="task-1", repository="repo", caller="audit")
+            module.JOB_STORE.launching("request-1")
+            module.JOB_STORE.recover_orphans()
+            before = module.JOB_STORE.get("request-1")
+            with mock.patch.object(module, "start_omp_process") as start:
+                with self.assertRaises(module.ProtocolError):
+                    module.parse_request(execute, endpoint="audit", peer_uid=997)
+            start.assert_not_called()
+            self.assertEqual(before, module.JOB_STORE.get("request-1"))
+            self.assertEqual(1, len(list(store.consumed.glob("*.json"))))
 
 
     def test_unsafe_or_unknown_lanes_refuse_reexecution(self) -> None:

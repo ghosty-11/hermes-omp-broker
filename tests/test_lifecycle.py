@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -17,10 +20,22 @@ class LifecycleTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.store = JobStore(Path(self.temp.name))
 
+    def child(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+            stdin=subprocess.PIPE, start_new_session=True)
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            process.stdin.close()
+        self.addCleanup(cleanup)
+        return process
+
     def test_prelaunch_record_survives_and_completed_result_is_retrievable(self) -> None:
         self.store.create("req-1", task_id="task-1", repository="repo", caller="caller")
         self.assertEqual("pending", self.store.get("req-1")["status"])
-        self.store.running("req-1", process_group=123)
+        self.store.running("req-1", process_group=self.child().pid)
         response = {"version": 1, "request_id": "req-1", "final": {"verdict": "MET"}}
         self.store.finish("req-1", "completed", response)
         record = self.store.get("req-1")
@@ -30,17 +45,17 @@ class LifecycleTest(unittest.TestCase):
     def test_recovery_classifies_pending_and_running_jobs_as_orphaned(self) -> None:
         self.store.create("pending", task_id="task", repository="repo", caller="caller")
         self.store.create("running", task_id="task", repository="repo", caller="caller")
-        self.store.running("running", process_group=456)
+        self.store.running("running", process_group=self.child().pid)
         self.store.recover_orphans()
         self.assertEqual("orphaned", self.store.get("pending")["status"])
         self.assertEqual("orphaned", self.store.get("running")["status"])
 
     def test_cancel_kills_recorded_group_and_records_cancelled(self) -> None:
         self.store.create("req", task_id="task", repository="repo", caller="caller")
-        self.store.running("req", process_group=789)
-        with mock.patch("broker.lifecycle.os.killpg") as kill:
-            self.assertTrue(self.store.cancel("req"))
-        kill.assert_called_once_with(789, 15)
+        child = self.child()
+        self.store.running("req", process_group=child.pid)
+        self.assertTrue(self.store.cancel("req"))
+        self.assertIn(child.wait(timeout=5), (-signal.SIGTERM, -signal.SIGKILL))
         self.assertEqual("cancelled", self.store.get("req")["status"])
 
     def test_delivery_failure_preserves_result_for_retrieval(self) -> None:
@@ -94,7 +109,7 @@ class LifecycleTest(unittest.TestCase):
 
     def test_reexecution_rejects_live_failed_and_missing_records(self) -> None:
         self.store.create("live", task_id="task", repository="repo", caller="caller")
-        self.store.running("live", process_group=123)
+        self.store.running("live", process_group=self.child().pid)
         self.store.create("failed", task_id="task", repository="repo", caller="caller")
         self.store.finish("failed", "failed", {})
         for request_id in ("live", "failed"):
@@ -133,12 +148,24 @@ class LifecycleTest(unittest.TestCase):
         self.store.create("completed", task_id="task", repository="repo", caller="caller")
         self.store.finish("completed", "completed", {"request_id": "completed"})
         self.store.create("running", task_id="task", repository="repo", caller="caller")
-        self.store.running("running", process_group=123)
+        self.store.running("running", process_group=self.child().pid)
         self.store.create("reexecuted", task_id="task", repository="repo", caller="caller")
         self.store.arm_reexecution(
             "reexecuted", task_id="task", repository="repo", caller="caller")
         for request_id in ("completed", "running", "reexecuted"):
             with self.subTest(request_id=request_id):
+                with self.assertRaises(ValueError):
+                    self.store.arm_reexecution(
+                        request_id, task_id="task", repository="repo", caller="caller")
+
+    def test_uncertain_launch_and_recovered_running_work_never_replay(self) -> None:
+        for request_id in ("launching", "running"):
+            with self.subTest(request_id=request_id):
+                self.store.create(request_id, task_id="task", repository="repo", caller="caller")
+                self.store.launching(request_id)
+                if request_id == "running":
+                    self.store.running(request_id, process_group=self.child().pid)
+                self.store.recover_orphans()
                 with self.assertRaises(ValueError):
                     self.store.arm_reexecution(
                         request_id, task_id="task", repository="repo", caller="caller")
