@@ -61,10 +61,12 @@ intentional service termination only when the service manager or operator sent
 ## Protocol v2 source staging
 
 Protocol v2 requires dedicated launchers, named sockets, endpoint users, socket access
-controls and one private lease store per endpoint. The generic user-service templates and
-the `omp-invoke.py` command-line entry point are protocol-v1 compatibility surfaces; they
-cannot start or call the protocol-v2 broker `main()`. Do not use the generic socket as a
-rollback or point a v1 client at a named v2 endpoint.
+controls, and one private lease store per endpoint. For `delegate_to_omp`, the
+`omp-invoke.py` command sends only a bounded brief, repository key, and task reference to
+the dedicated issuer's ingress socket. The reference is correlation, not authority.
+The issuer generates request and task IDs and redeems a v2 lease on a different socket.
+Generic protocol-v1 user-service templates and other v1 CLI callers cannot use a named
+v2 endpoint. Do not activate the generic socket as a fallback.
 
 The broker requires one unique systemd `FileDescriptorName` for each listener. The accepted
 listener name fixes the endpoint, and Unix `SO_PEERCRED` supplies the exact peer UID. The
@@ -73,6 +75,12 @@ directory as comma-separated `endpoint=/path` entries. The
 `HERMES_OMP_ENDPOINT_USERS` environment variable maps the same endpoints to dedicated
 launcher user names. The broker resolves those names to exact UIDs during startup. Every
 listener name must have exactly one lease-directory and launcher-user mapping.
+
+The separate coding broker uses `HERMES_OMP_ENDPOINT_CALLERS=delegate=delegate_to_omp`
+to bind its private endpoint before consuming a lease or exposing status. It reads the
+root-owned `/etc/omp-delegation-broker/broker-policy.json`; the dedicated issuer reads
+`/etc/omp-delegation-broker/ingress.json`. These policies admit one disposable canary
+repository. The backlog broker keeps its distinct policy and six endpoint identities.
 
 The trusted dedicated launcher mints each opaque lease in its mapped store and redeems that
 lease through its mapped endpoint under the same launcher UID. The opaque lease never leaves

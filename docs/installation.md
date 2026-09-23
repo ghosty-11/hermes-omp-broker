@@ -100,26 +100,25 @@ Starting the generic socket with the v2 broker fails closed before accepting wor
 
 ## Caller installation
 
-Protocol-v2 callers do not send prompts or authority fields through the socket. Install a
-dedicated launcher that owns its lease store, fixes the request before issuance and imports
-`invoke_broker_v2()` from `client/omp-invoke.py`.
+The private protocol-v2 broker endpoint receives only a launcher-owned opaque
+lease. For `delegate_to_omp`, the command-line client uses a separate ingress
+socket and sends only a bounded brief, admitted repository key, and untrusted
+task reference. A dedicated launcher fixes caller, workspace, model, sandbox,
+timeout, and request identity from root-owned policy before it mints the lease.
+The generic protocol-v1 user-service templates are not a fallback for this path.
 
-The `omp-invoke.py` command-line entry point and `plugin/` implement the protocol-v1
-compatibility client. Do not point them at a protocol-v2 named endpoint.
-Configure these caller-side values:
+Configure the Hermes-facing client for the ingress, not the broker endpoint:
 
 ```text
-HERMES_OMP_POLICY=/absolute/caller-readable/policy.json
+HERMES_OMP_POLICY=/absolute/caller-readable/delegation-policy.json
 HERMES_OMP_INVOKE=/absolute/path/to/omp-invoke.py
-HERMES_OMP_BROKER_SOCKET=/run/user/23456/hermes-omp-broker/omp.sock
-HERMES_OMP_MODEL=provider/model
+HERMES_OMP_BROKER_SOCKET=/absolute/ingress.sock
 ```
 
-The socket path's numeric directory is the coding identity's UID, not the caller UID.
-
-The caller-readable policy supplies only the fixed client path, socket, model, repository
-map, and caller entries needed for admission. It must not contain credentials. Confirm the
-plugin exposes exactly `delegate_to_omp` only on profiles authorized to delegate.
+The caller-readable policy limits the tool's visible repository keys; it is not
+an approval or a lease. Root-owned issuer and broker policies decide admission
+and must contain no credentials. Confirm the plugin exposes `delegate_to_omp`
+only on the profiles authorized to request delegation.
 
 ## Pre-enable verification
 

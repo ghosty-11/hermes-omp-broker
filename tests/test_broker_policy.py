@@ -1161,6 +1161,41 @@ class ProtocolV2LeaseTest(unittest.TestCase):
             self.assertTrue(request.reexecuted)
 
 
+    def test_endpoint_rejects_valid_foreign_caller_before_spending_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            module = self._load(root)
+            module.ENDPOINT_CALLERS = {"audit": "audit"}
+            module.CALLER_POLICIES["other"] = dict(module.CALLER_POLICIES["audit"])
+            module.ALLOWED_WORKSPACES["other"] = module.ALLOWED_WORKSPACES["audit"]
+            module.ALLOWED_SANDBOXES["other"] = module.ALLOWED_SANDBOXES["audit"]
+            lease_id = self._issue(module, root, fixed={"caller": "other"})
+            with self.assertRaises(module.ProtocolError) as raised:
+                module.parse_request(
+                    {"version": 2, "op": "execute", "lease_id": lease_id},
+                    endpoint="audit", peer_uid=997)
+            self.assertEqual("job unavailable", str(raised.exception))
+            self.assertEqual([], list(module.LEASE_STORES["audit"].consumed.glob("*.json")))
+            self.assertEqual([], list((root / "jobs").glob("*.json")))
+
+    def test_endpoint_rejects_foreign_caller_status_without_exposing_job(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            module = self._load(root)
+            module.ENDPOINT_CALLERS = {"audit": "audit"}
+            module.CALLER_POLICIES["other"] = dict(module.CALLER_POLICIES["audit"])
+            module.ALLOWED_WORKSPACES["other"] = module.ALLOWED_WORKSPACES["audit"]
+            module.ALLOWED_SANDBOXES["other"] = module.ALLOWED_SANDBOXES["audit"]
+            lease_id = self._issue(module, root, fixed={"caller": "other"})
+            module.LEASE_STORES["audit"].consume(
+                lease_id, endpoint="audit", peer_uid=997)
+            with self.assertRaises(module.ProtocolError) as raised:
+                module.parse_request(
+                    {"version": 2, "op": "status", "lease_id": lease_id},
+                    endpoint="audit", peer_uid=997)
+            self.assertEqual("job unavailable", str(raised.exception))
+            self.assertEqual([], list((root / "jobs").glob("*.json")))
+
     def test_happy_path_consumes_the_lease_exactly_once(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             module = self._load(Path(td))

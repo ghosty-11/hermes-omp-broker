@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import socket
+import struct
 import subprocess
+import threading
 import sys
 import tempfile
 import unittest
@@ -30,6 +33,80 @@ def load_plugin():
     spec.loader.exec_module(module)
     return module
 
+
+class TestOmpDelegateAvailability(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = load_plugin()
+
+    def test_availability_requires_a_live_backend_health_result(self) -> None:
+        for healthy in (False, True):
+            with self.subTest(healthy=healthy), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                invoke = root / "omp-invoke.py"
+                invoke.write_text("#!/bin/sh\n")
+                invoke.chmod(0o755)
+                ingress = root / "ingress.sock"
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(str(ingress))
+                listener.listen(1)
+                observed: dict[str, object] = {}
+
+                def serve() -> None:
+                    conn, _ = listener.accept()
+                    with conn:
+                        header = conn.recv(4)
+                        if len(header) != 4:
+                            return
+                        size = struct.unpack("!I", header)[0]
+                        payload = bytearray()
+                        while len(payload) < size:
+                            payload.extend(conn.recv(size - len(payload)))
+                        observed.update(json.loads(payload))
+                        body = json.dumps({
+                            "version": 1, "op": "health", "ok": healthy,
+                        }).encode()
+                        conn.sendall(struct.pack("!I", len(body)) + body)
+
+                worker = threading.Thread(target=serve, daemon=True)
+                worker.start()
+                try:
+                    with (
+                        mock.patch.object(self.module, "INVOKE", str(invoke)),
+                        mock.patch.object(self.module, "BROKER_SOCKET", str(ingress)),
+                    ):
+                        available = self.module._available()
+                finally:
+                    worker.join(timeout=2)
+                    listener.close()
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(healthy, available)
+                self.assertEqual({"version": 1, "op": "health"}, observed)
+
+
+    def test_clean_foreign_owned_canary_is_read_without_index_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "canary"
+            repo.mkdir()
+            for command in (
+                ["git", "init", "-q", str(repo)],
+                ["git", "-C", str(repo), "config", "user.name", "Fixture"],
+                ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+            ):
+                subprocess.run(command, check=True, capture_output=True)
+            (repo / "seed.txt").write_text("baseline\n")
+            subprocess.run(["git", "-C", str(repo), "add", "seed.txt"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "baseline"],
+                           check=True, capture_output=True)
+            with mock.patch.dict(os.environ, {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}):
+                baseline = subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                    capture_output=True)
+                if baseline.returncode == 0:
+                    self.skipTest("Git cannot emulate a foreign owner on this host")
+                head, dirty = self.module._clean_write_baseline(str(repo))
+            self.assertEqual(40, len(head or ""))
+            self.assertEqual("", dirty)
 
 class TestOmpDelegateAdmission(unittest.TestCase):
     def setUp(self) -> None:
@@ -82,77 +159,6 @@ class TestOmpDelegateAdmission(unittest.TestCase):
                 {"repo": "fixture", "brief": BRIEF, "task_id": "fixture-task"}
             )
 
-    def test_availability_requires_the_client_and_a_connectable_broker_socket(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            invoke = root / "omp-invoke.py"
-            broker_socket = root / "omp.sock"
-            invoke.write_text("#!/bin/sh\n")
-            invoke.chmod(0o755)
-            with (
-                mock.patch.object(self.module, "INVOKE", str(invoke)),
-                mock.patch.object(self.module, "BROKER_SOCKET", str(broker_socket)),
-            ):
-                self.assertFalse(
-                    self.module._available(),
-                    "advertised delegation with no socket present",
-                )
-
-                broker_socket.touch()
-                self.assertFalse(
-                    self.module._available(),
-                    "a regular file at the socket path advertised a broker that cannot accept",
-                )
-                broker_socket.unlink()
-
-                stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.addCleanup(stale.close)
-                stale.bind(str(broker_socket))
-                self.assertFalse(
-                    self.module._available(),
-                    "a bound but unlistening socket advertised a broker that cannot accept",
-                )
-                stale.close()
-                broker_socket.unlink()
-
-                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.addCleanup(listener.close)
-                listener.bind(str(broker_socket))
-                listener.listen(1)
-                self.assertTrue(
-                    self.module._available(),
-                    "refused delegation while a real broker was listening",
-                )
-
-    def test_availability_probe_leaves_the_broker_unmutated(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            invoke = root / "omp-invoke.py"
-            broker_socket = root / "omp.sock"
-            invoke.write_text("#!/bin/sh\n")
-            invoke.chmod(0o755)
-            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.addCleanup(listener.close)
-            listener.bind(str(broker_socket))
-            listener.listen(1)
-            listener.settimeout(5)
-            with (
-                mock.patch.object(self.module, "INVOKE", str(invoke)),
-                mock.patch.object(self.module, "BROKER_SOCKET", str(broker_socket)),
-            ):
-                self.assertTrue(self.module._available())
-
-            try:
-                accepted, _ = listener.accept()
-            except socket.timeout:
-                self.fail("the probe never connected, so availability was not proven")
-            self.addCleanup(accepted.close)
-            accepted.settimeout(5)
-            self.assertEqual(
-                b"",
-                accepted.recv(64),
-                "the probe sent request bytes instead of closing immediately",
-            )
 
     def test_dirty_repository_is_refused_before_the_writer_runs(self) -> None:
         with tempfile.TemporaryDirectory() as td:

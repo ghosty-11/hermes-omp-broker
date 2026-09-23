@@ -221,12 +221,36 @@ def _load_endpoint_uids(raw: str) -> dict[str, int]:
     }
 
 
+def _load_endpoint_callers(raw: str) -> dict[str, str]:
+    """Bind a private named endpoint to one trusted caller policy."""
+    if not raw:
+        return {}
+    callers: dict[str, str] = {}
+    for item in raw.split(","):
+        endpoint, separator, caller = item.partition("=")
+        if (
+            not separator
+            or not endpoint
+            or not caller
+            or not all(char.isalnum() or char in "_-" for char in endpoint)
+            or not all(char.isalnum() or char in "_-" for char in caller)
+            or endpoint in callers
+        ):
+            raise SystemExit(
+                "omp-delegate-broker: invalid HERMES_OMP_ENDPOINT_CALLERS mapping")
+        callers[endpoint] = caller
+    return callers
+
+
 ENDPOINT_IDENTITIES = _load_endpoint_identities(
     os.environ.get("HERMES_OMP_ENDPOINT_USERS", ""))
 ENDPOINT_UIDS = {
     endpoint: identity[0]
     for endpoint, identity in ENDPOINT_IDENTITIES.items()
 }
+ENDPOINT_CALLERS = _load_endpoint_callers(
+    os.environ.get("HERMES_OMP_ENDPOINT_CALLERS", ""))
+
 
 LEASE_STORES = _load_lease_stores()
 _ACTIVE_PROCESS_GROUP: int | None = None
@@ -618,6 +642,9 @@ def parse_request(
                      **store.peek(
                          value["lease_id"], endpoint=endpoint, peer_uid=peer_uid)},
                     peer_uid=None)
+                bound_caller = ENDPOINT_CALLERS.get(endpoint)
+                if bound_caller is not None and request.caller != bound_caller:
+                    raise LeaseUnavailable(_lifecycle.LEASE_UNAVAILABLE)
                 try:
                     store.consume(
                         value["lease_id"], endpoint=endpoint, peer_uid=peer_uid)
@@ -635,6 +662,9 @@ def parse_request(
                 return dataclasses.replace(request, protocol_version=2)
             fixed = store.resolve(
                 value["lease_id"], endpoint=endpoint, peer_uid=peer_uid)
+            bound_caller = ENDPOINT_CALLERS.get(endpoint)
+            if bound_caller is not None and fixed["caller"] != bound_caller:
+                raise LeaseUnavailable(_lifecycle.LEASE_UNAVAILABLE)
             return StatusRequest(
                 str(fixed["request_id"]), str(fixed["caller"]),
                 str(fixed["repository"]), 2,
@@ -1568,6 +1598,9 @@ def systemd_listeners() -> list[ListenerEndpoint]:
     if any(name not in ENDPOINT_UIDS for name in names):
         raise SystemExit(
             "omp-delegate-broker: every named listener requires an endpoint user")
+    if "delegate" in names and ENDPOINT_CALLERS.get("delegate") != "delegate_to_omp":
+        raise SystemExit(
+            "omp-delegate-broker: delegate listener requires a fixed caller binding")
     return [
         ListenerEndpoint(name, socket.socket(fileno=3 + offset))
         for offset, name in enumerate(names)

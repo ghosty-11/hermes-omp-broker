@@ -19,6 +19,7 @@ MODEL = os.environ.get("HERMES_OMP_MODEL", "provider/model")
 MAX_PROMPT_CHARS = 500_000
 MAX_RESPONSE_BYTES = 8_000_000
 ABSOLUTE_V2_TIMEOUT = 3630.0
+MAX_INGRESS_BRIEF_CHARS = 8000
 RESPONSE_FIELDS = {
     "version", "exit_code", "stdout", "stderr", "timed_out",
     "process_group_clear", "final", "request_id",
@@ -562,34 +563,74 @@ def health_broker_v2(socket_path: Path) -> dict[str, object]:
     return validate_health_response(response)
 
 
-def invoke_broker_v2(
-    socket_path: Path, lease_id: str, op: str,
-) -> dict[str, object]:
-    """Redeem or inspect a server-fixed lease without sending authority text."""
-    if not isinstance(lease_id, str) or not lease_id or op not in {"execute", "status"}:
-        raise InvocationError("invalid protocol v2 lease request")
-    request = {"version": 2, "op": op, "lease_id": lease_id}
+def _exchange_ingress(
+    socket_path: Path, request: dict[str, object], *, timeout: float,
+) -> object:
     payload = json.dumps(request, separators=(",", ":")).encode()
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-            conn.settimeout(ABSOLUTE_V2_TIMEOUT)
+            conn.settimeout(timeout)
             conn.connect(str(socket_path))
             conn.sendall(struct.pack("!I", len(payload)) + payload)
             conn.shutdown(socket.SHUT_WR)
             size = struct.unpack("!I", _recv_exact(conn, 4))[0]
             if size <= 0 or size > MAX_RESPONSE_BYTES:
-                raise InvocationError("broker response is outside the size bound")
-            response = json.loads(_recv_exact(conn, size))
+                raise InvocationError("ingress response is outside the size bound")
+            return json.loads(_recv_exact(conn, size))
     except (OSError, json.JSONDecodeError, struct.error) as exc:
-        raise InvocationError(f"OMP broker request failed: {exc}") from exc
+        raise InvocationError(f"OMP ingress request failed: {exc}") from exc
+
+
+def _valid_ingress_identity(repo: str, task_ref: str) -> bool:
+    return (
+        isinstance(repo, str)
+        and bool(repo)
+        and len(repo) <= 64
+        and all(char.isalnum() or char in "_-" for char in repo)
+        and isinstance(task_ref, str)
+        and bool(task_ref)
+        and len(task_ref) <= 128
+    )
+
+
+def invoke_ingress(
+    socket_path: Path, repo: str, brief: str, task_ref: str,
+) -> dict[str, object]:
+    """Send untrusted task input; the launcher fixes every execution field."""
     if (
-        isinstance(response, dict)
-        and set(response) == {"version", "op", "ok", "error"}
-        and response.get("op") != op
+        not _valid_ingress_identity(repo, task_ref)
+        or not isinstance(brief, str)
+        or not brief
+        or len(brief) > MAX_INGRESS_BRIEF_CHARS
     ):
-        raise InvocationError("broker returned an invalid error response contract")
-    if op == "execute":
-        return validate_response(response, version=2)
+        raise InvocationError("delegation input is outside the ingress bound")
+    request = {
+        "version": 1, "op": "execute", "repo": repo,
+        "brief": brief, "task_ref": task_ref,
+    }
+    return validate_response(
+        _exchange_ingress(socket_path, request, timeout=ABSOLUTE_V2_TIMEOUT),
+        version=2,
+    )
+
+
+def request_ingress_status(
+    socket_path: Path, repo: str, task_ref: str,
+) -> dict[str, object]:
+    """Recover a job by correlation without exposing its private lease handle."""
+    if not _valid_ingress_identity(repo, task_ref):
+        raise InvocationError("delegation input is outside the ingress bound")
+    request = {
+        "version": 1, "op": "status", "repo": repo, "task_ref": task_ref,
+    }
+    return validate_v2_status_response(
+        _exchange_ingress(socket_path, request, timeout=30),
+    )
+
+
+
+
+def validate_v2_status_response(response: object) -> dict[str, object]:
     if (
         not isinstance(response, dict)
         or response.get("version") != 2
@@ -623,6 +664,37 @@ def invoke_broker_v2(
     if job.get("result") is not None and not isinstance(job["result"], dict):
         raise InvocationError("broker returned an invalid status job result")
     return job
+
+
+def invoke_broker_v2(
+    socket_path: Path, lease_id: str, op: str,
+) -> dict[str, object]:
+    """Redeem or inspect a server-fixed lease without sending authority text."""
+    if not isinstance(lease_id, str) or not lease_id or op not in {"execute", "status"}:
+        raise InvocationError("invalid protocol v2 lease request")
+    request = {"version": 2, "op": op, "lease_id": lease_id}
+    payload = json.dumps(request, separators=(",", ":")).encode()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(ABSOLUTE_V2_TIMEOUT)
+            conn.connect(str(socket_path))
+            conn.sendall(struct.pack("!I", len(payload)) + payload)
+            conn.shutdown(socket.SHUT_WR)
+            size = struct.unpack("!I", _recv_exact(conn, 4))[0]
+            if size <= 0 or size > MAX_RESPONSE_BYTES:
+                raise InvocationError("broker response is outside the size bound")
+            response = json.loads(_recv_exact(conn, size))
+    except (OSError, json.JSONDecodeError, struct.error) as exc:
+        raise InvocationError(f"OMP broker request failed: {exc}") from exc
+    if (
+        isinstance(response, dict)
+        and set(response) == {"version", "op", "ok", "error"}
+        and response.get("op") != op
+    ):
+        raise InvocationError("broker returned an invalid error response contract")
+    if op == "execute":
+        return validate_response(response, version=2)
+    return validate_v2_status_response(response)
 
 
 def format_response(response: Mapping[str, object], *, caller: str) -> str:
@@ -682,17 +754,18 @@ def main() -> int:
             print("omp-invoke: expected --status REQUEST_ID and optional --json", file=sys.stderr)
             return 2
         try:
-            caller, repository = resolve_status_identity(os.environ)
             socket_path = Path(os.environ.get(
                 "OMP_DELEGATE_BROKER_SOCKET",
                 str(_policy_socket(os.environ)),
             ))
-            job = request_status(
-                socket_path,
-                request_id=request_id,
-                caller=caller,
-                repository=repository,
-            )
+            if os.environ.get("OMP_INVOKED_BY", "delegate_to_omp") == "delegate_to_omp":
+                job = request_ingress_status(
+                    socket_path, os.environ.get("OMP_REPOSITORY", ""), request_id)
+            else:
+                caller, repository = resolve_status_identity(os.environ)
+                job = request_status(
+                    socket_path, request_id=request_id,
+                    caller=caller, repository=repository)
             output = (
                 json.dumps(job, separators=(",", ":")) + "\n"
                 if remaining
@@ -715,18 +788,26 @@ def main() -> int:
         return 2
     prompt = args[0] if args else sys.stdin.read()
     try:
-        policy = resolve_policy(os.environ, Path.cwd())
         socket_path = Path(os.environ.get(
             "OMP_DELEGATE_BROKER_SOCKET",
             str(_policy_socket(os.environ)),
         ))
-        response = invoke_broker(socket_path, policy, prompt)
+        if os.environ.get("OMP_INVOKED_BY", "delegate_to_omp") == "delegate_to_omp":
+            caller = "delegate_to_omp"
+            requested_model = ""
+            response = invoke_ingress(
+                socket_path, os.environ.get("OMP_REPOSITORY", ""), prompt,
+                os.environ.get("OMP_TASK_ID", ""))
+        else:
+            policy = resolve_policy(os.environ, Path.cwd())
+            caller, requested_model = policy.caller, policy.model
+            response = invoke_broker(socket_path, policy, prompt)
         output = (
             format_json_response(
-                response, caller=policy.caller, requested_model=policy.model,
+                response, caller=caller, requested_model=requested_model,
             )
             if json_output
-            else format_response(response, caller=policy.caller)
+            else format_response(response, caller=caller)
         )
         sys.stdout.write(output)
     except InvocationError as exc:

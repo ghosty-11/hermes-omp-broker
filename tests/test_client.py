@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import importlib.util
 import json
 import socket
@@ -133,6 +134,127 @@ class TestOmpInvoke(unittest.TestCase):
             self.assertEqual("bounded prompt", observed["prompt"])
             self.assertTrue(observed["write_half_closed"])
             self.assertEqual(final, response["final"])
+
+    def test_delegate_tool_sends_only_untrusted_ingress_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            socket_path = root / "ingress.sock"
+            policy_path = root / "policy.json"
+            policy_path.write_text(json.dumps({
+                "socket": str(socket_path),
+                "repositories": {"fixture": {"path": str(root / "repo")}},
+                "callers": {"delegate_to_omp": {
+                    "repositories": ["fixture"], "sandbox": "workspace-write",
+                    "model": "provider/fixed",
+                }},
+            }))
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            listener.listen(1)
+            observed: dict[str, object] = {}
+
+            def serve() -> None:
+                conn, _ = listener.accept()
+                with conn:
+                    size = struct.unpack("!I", conn.recv(4))[0]
+                    payload = bytearray()
+                    while len(payload) < size:
+                        payload.extend(conn.recv(size - len(payload)))
+                    observed.update(json.loads(payload))
+                    response = {
+                        "version": 2, "exit_code": 0, "stdout": "", "stderr": "",
+                        "timed_out": False, "process_group_clear": True,
+                        "final": {
+                            "summary": "ingress fixture", "verification": ["fake exchange"],
+                            "gaps": [], "verdict": "MET",
+                        },
+                        "request_id": "server-generated",
+                    }
+                    body = json.dumps(response).encode()
+                    conn.sendall(struct.pack("!I", len(body)) + body)
+
+            worker = threading.Thread(target=serve)
+            worker.start()
+            output = io.StringIO()
+            try:
+                with mock.patch.dict(self.module.os.environ, {
+                    "OMP_INVOKED_BY": "delegate_to_omp",
+                    "OMP_REPOSITORY": "fixture",
+                    "OMP_TASK_ID": "operator-correlation",
+                    "HERMES_OMP_POLICY": str(policy_path),
+                    "OMP_DELEGATE_BROKER_SOCKET": str(socket_path),
+                }), mock.patch.object(self.module.sys, "argv", [
+                    "omp-invoke.py", "--json", "bounded implementation brief",
+                ]), mock.patch.object(self.module.sys, "stdout", output):
+                    rc = self.module.main()
+            finally:
+                worker.join(timeout=2)
+                listener.close()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual({
+                "version": 1, "op": "execute", "repo": "fixture",
+                "brief": "bounded implementation brief",
+                "task_ref": "operator-correlation",
+            }, observed)
+            self.assertEqual(0, rc)
+            self.assertEqual("ingress fixture", json.loads(output.getvalue())["summary"])
+
+    def test_delegate_status_uses_correlation_not_caller_or_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            socket_path = Path(td) / "ingress.sock"
+            policy_path = Path(td) / "policy.json"
+            policy_path.write_text(json.dumps({
+                "socket": str(socket_path),
+                "repositories": {"fixture": {"path": str(Path(td) / "repo")}},
+                "callers": {"delegate_to_omp": {"repositories": ["fixture"]}},
+            }))
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            listener.listen(1)
+            observed: dict[str, object] = {}
+
+            def serve() -> None:
+                conn, _ = listener.accept()
+                with conn:
+                    size = struct.unpack("!I", conn.recv(4))[0]
+                    payload = bytearray()
+                    while len(payload) < size:
+                        payload.extend(conn.recv(size - len(payload)))
+                    observed.update(json.loads(payload))
+                    job = {
+                        "request_id": "server-generated", "task_id": "server-task",
+                        "repository": "fixture", "caller": "delegate_to_omp",
+                        "status": "pending", "result": None,
+                        "created_at": 1, "updated_at": 1,
+                    }
+                    body = json.dumps({
+                        "version": 2, "op": "status", "ok": True, "job": job,
+                    }).encode()
+                    conn.sendall(struct.pack("!I", len(body)) + body)
+
+            worker = threading.Thread(target=serve, daemon=True)
+            worker.start()
+            output = io.StringIO()
+            try:
+                with mock.patch.dict(self.module.os.environ, {
+                    "OMP_INVOKED_BY": "delegate_to_omp",
+                    "OMP_REPOSITORY": "fixture",
+                    "HERMES_OMP_POLICY": str(policy_path),
+                    "OMP_DELEGATE_BROKER_SOCKET": str(socket_path),
+                }), mock.patch.object(self.module.sys, "argv", [
+                    "omp-invoke.py", "--status", "operator-correlation", "--json",
+                ]), mock.patch.object(self.module.sys, "stdout", output):
+                    rc = self.module.main()
+            finally:
+                worker.join(timeout=2)
+                listener.close()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual({
+                "version": 1, "op": "status", "repo": "fixture",
+                "task_ref": "operator-correlation",
+            }, observed)
+            self.assertEqual(0, rc)
+            self.assertEqual("server-generated", json.loads(output.getvalue())["request_id"])
 
     def test_response_must_be_completed_group_clear_and_typed(self) -> None:
         base = {

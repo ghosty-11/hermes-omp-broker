@@ -6,10 +6,12 @@ trusted from model prose.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
 import stat
+import struct
 import subprocess
 from typing import Any
 
@@ -68,26 +70,43 @@ BROKER_PROBE_TIMEOUT_S = 2.0
 
 
 def _broker_reachable(path: str) -> bool:
-    """A socket that cannot accept must never advertise the tool.
-
-    Existence is not availability: a stale or unrelated file at the socket path would
-    offer a delegating agent its only write path and then fail at call time. The probe
-    connects and closes without sending a frame, so the broker records no job.
-    """
+    """Advertise only when ingress confirms its private backend without a job."""
     try:
         if not stat.S_ISSOCK(os.stat(path).st_mode):
             return False
     except OSError:
         return False
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    request = json.dumps(
+        {"version": 1, "op": "health"}, separators=(",", ":")).encode()
     try:
-        probe.settimeout(BROKER_PROBE_TIMEOUT_S)
-        probe.connect(path)
-    except OSError:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(BROKER_PROBE_TIMEOUT_S)
+            probe.connect(path)
+            probe.sendall(struct.pack("!I", len(request)) + request)
+            probe.shutdown(socket.SHUT_WR)
+
+            def receive(size: int) -> bytes:
+                data = bytearray()
+                while len(data) < size:
+                    chunk = probe.recv(size - len(data))
+                    if not chunk:
+                        raise OSError("ingress health response ended early")
+                    data.extend(chunk)
+                return bytes(data)
+
+            length = struct.unpack("!I", receive(4))[0]
+            if not 1 <= length <= 128:
+                return False
+            response = json.loads(receive(length))
+    except (OSError, ValueError, struct.error):
         return False
-    finally:
-        probe.close()
-    return True
+    return (
+        isinstance(response, dict)
+        and set(response) == {"version", "op", "ok"}
+        and response["version"] == 1
+        and response["op"] == "health"
+        and response["ok"] is True
+    )
 
 
 def _available() -> bool:
@@ -98,10 +117,18 @@ def _available() -> bool:
     )
 
 
+def _git_command(repo: str, *args: str) -> list[str]:
+    return [
+        "git", "--no-optional-locks", "-c", f"safe.directory={os.path.realpath(repo)}",
+        "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+        "-C", repo, *args,
+    ]
+
+
 def _git(repo: str, *args: str) -> str:
     try:
         proc = subprocess.run(
-            ["git", "-C", repo, *args],
+            _git_command(repo, *args),
             capture_output=True, text=True, timeout=60, shell=False,
         )
         return (proc.stdout or "").strip()
@@ -113,7 +140,7 @@ def _git_porcelain(repo: str, *args: str) -> str:
     """Return porcelain output without stripping its significant leading status space."""
     try:
         proc = subprocess.run(
-            ["git", "-C", repo, *args],
+            _git_command(repo, *args),
             capture_output=True, text=True, timeout=60, shell=False,
         )
         return proc.stdout or ""
@@ -125,16 +152,16 @@ def _clean_write_baseline(repo: str) -> tuple[str, str] | tuple[None, str]:
     """Return an attributable Git baseline, or a fail-closed refusal reason."""
     try:
         head = subprocess.run(
-            ["git", "-C", repo, "rev-parse", "--verify", "HEAD^{commit}"],
+            _git_command(repo, "rev-parse", "--verify", "HEAD^{commit}"),
             capture_output=True, text=True, timeout=60, shell=False,
         )
         if head.returncode != 0 or not (head.stdout or "").strip():
             return None, "the repository does not have a valid Git HEAD"
         status = subprocess.run(
-            [
-                "git", "-C", repo, "status", "--porcelain=v1",
+            _git_command(
+                repo, "status", "--porcelain=v1",
                 "--untracked-files=all", "--ignore-submodules=none",
-            ],
+            ),
             capture_output=True, text=True, timeout=60, shell=False,
         )
         if status.returncode != 0:

@@ -14,6 +14,11 @@ The broker installs independently of [`hermes-mailbox`](https://github.com/ghost
 
 Reference implementation extracted from a deployed private system. The deterministic suite covers client framing and typed finals, clean-baseline admission, repository-key rejection, bounded tool policy, workspace escapes, networkless bash, typed finalization, durable pre-launch records, cancellation state, orphan recovery, delivery-failure result retention, and package metadata. Live clean-install, disposable cancellation/restart, and retained-result scenarios remain unexercised by this reusable package; run them against each deployment before relying on those paths.
 
+The Hermes-facing protocol-v2 issuer repair is source-only as of 2026-09-23. The
+dedicated issuer, private broker endpoint, and one-repository canary require a
+separate operator trust decision, root deployment, and a real-job acceptance window.
+No source fixture proves the `ghosty` model child cannot read its home credentials.
+
 ## Boundary
 
 Callers provide a repository key and complete standalone brief. Deployment policy owns paths, admitted local identity, model, sandbox, timeout, output, concurrency, and credentials. OMP receives only bounded tools through the extension. Model summaries are claims; the caller compares them with broker-observed Git and verification evidence.

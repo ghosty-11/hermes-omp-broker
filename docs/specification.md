@@ -26,6 +26,11 @@ A production bridge must:
 
 The JSON Schema in [`schemas/coding-job.schema.json`](../schemas/coding-job.schema.json) defines the protocol-v1 wire request and response. Authorization belongs in the broker, not in the schema. The public request `timeout` maximum is 3600 seconds so a policy-raised ceiling can travel on the wire; the broker still applies the caller's admitted bound, default 810.
 
+The `delegate_to_omp` ingress has a separate five-field execute request:
+`version`, `op`, `repo`, `brief`, and `task_ref`. The four-field status request
+omits `brief`. The task reference is correlation, never a lease or approval.
+The private broker still receives only the version-2 opaque lease request.
+
 ### Protocol operations
 
 Protocol version 1 supports invoke and status operations. An invoke request has the
@@ -80,10 +85,11 @@ produce the same response:
 {"version":1,"op":"status","ok":false,"error":"job unavailable"}
 ```
 
-The client command `omp-invoke --status REQUEST_ID` takes caller and repository identity
-from `OMP_INVOKED_BY` and `OMP_REPOSITORY`. It validates that pair against policy before it
-opens the broker socket. The status path does not read a prompt or resolve a workspace or
-model. Add `--json` before or after `--status REQUEST_ID` to print the job object as JSON.
+For the explicit `delegate_to_omp` caller, `omp-invoke --status TASK_REF`
+sends the repository key and task reference to the separate ingress. The ingress
+returns a typed job status without giving Hermes the private lease handle.
+Other protocol-v1 callers continue to use `omp-invoke --status REQUEST_ID`
+with caller and repository from policy. A status request starts no new task.
 
 ## OMP integration modes
 
