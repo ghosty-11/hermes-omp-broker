@@ -53,6 +53,9 @@ ABSOLUTE_MAX_TIMEOUT = 3600.0
 FRAME_TIMEOUT = 5.0
 MAX_CONTROL_CONNECTIONS = 8
 MAX_WAITING_EXECUTIONS = 16
+WORKER_SOCKET = os.environ.get("HERMES_OMP_WORKER_SOCKET", "")
+WORKER_USER = os.environ.get("HERMES_OMP_WORKER_USER", "omp-delegate-worker")
+CREDENTIAL_SOURCE = os.environ.get("HERMES_OMP_CREDENTIAL_SOURCE", "omp-token")
 JOB_STORE = JobStore(Path(os.environ.get("HERMES_OMP_JOB_DIR", "state/jobs")))
 
 
@@ -890,7 +893,40 @@ def credential_providers(request: Request) -> tuple[str, ...]:
     return tuple(providers)
 
 
+def worker_gateway_key() -> str:
+    """Validate the worker-only credential without sending it over the broker socket."""
+    if CREDENTIAL_SOURCE != "systemd":
+        raise ProtocolError("worker credential source is unavailable")
+    directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not directory or not Path(directory).is_absolute():
+        raise ProtocolError("worker credential directory is unavailable")
+    path = Path(directory) / "gateway-key"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 4096:
+                raise ProtocolError("worker credential is invalid")
+            token = os.read(fd, 4097).rstrip(b"\r\n")
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise ProtocolError("worker credential is unavailable") from exc
+    if not token or b"\x00" in token or any(chr(c).isspace() for c in token):
+        raise ProtocolError("worker credential is invalid")
+    try:
+        return token.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("worker credential has invalid encoding") from exc
+
+
 def resolve_provider_api_keys(request: Request) -> dict[str, str]:
+    if CREDENTIAL_SOURCE == "systemd":
+        if credential_providers(request) != ("gateway",):
+            raise ProtocolError("worker credential is scoped to the gateway provider")
+        return {"gateway": worker_gateway_key()}
+    if CREDENTIAL_SOURCE != "omp-token":
+        raise ProtocolError("credential source is not configured")
     env = {
         "HOME": os.environ.get("HERMES_OMP_HOME", str(Path.home())),
         "PATH": os.environ.get("HERMES_OMP_PATH", os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")),
@@ -931,8 +967,13 @@ def start_omp_process(
     final_path: Path,
     provider_api_keys: Mapping[str, str],
 ) -> subprocess.Popen[bytes]:
-    OMP_AGENT_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(OMP_AGENT_DIR, 0o700)
+    if CREDENTIAL_SOURCE == "systemd":
+        # The worker's model catalog is root-owned; the worker cannot chmod it.
+        if not OMP_AGENT_DIR.is_dir():
+            raise OSError("worker model catalog directory is unavailable")
+    else:
+        OMP_AGENT_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(OMP_AGENT_DIR, 0o700)
     payload = json.dumps(provider_api_keys, separators=(",", ":")).encode()
     credential_fd = os.memfd_create("omp-provider-api-keys", os.MFD_CLOEXEC)
     try:
@@ -1076,6 +1117,10 @@ def _valid_final(path: Path, *, caller: str) -> dict[str, object] | None:
         value = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return None
+    return _valid_final_value(value, caller=caller)
+
+
+def _valid_final_value(value: object, *, caller: str) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
     keys = set(value)
@@ -1160,21 +1205,37 @@ def _watch_client_lifetime(
     process_group: int,
     stop: threading.Event,
     disconnected: threading.Event,
+    request_id: str = "",
 ) -> None:
     poller = select.poll()
+    control = select.POLLIN if CREDENTIAL_SOURCE == "systemd" else 0
     poller.register(
         conn.fileno(),
-        select.POLLHUP | select.POLLERR | select.POLLNVAL | getattr(select, "POLLRDHUP", 0),
+        select.POLLHUP | select.POLLERR | select.POLLNVAL
+        | getattr(select, "POLLRDHUP", 0) | control,
     )
     while not stop.is_set():
-        events = poller.poll(50)
-        if not events:
-            continue
-        fatal = any(mask & (select.POLLHUP | select.POLLERR | select.POLLNVAL) for _, mask in events)
-        if fatal:
-            disconnected.set()
-            _kill_process_group(process_group)
-            return
+        for _, mask in poller.poll(50):
+            fatal = bool(mask & (select.POLLHUP | select.POLLERR | select.POLLNVAL))
+            if mask & control and not fatal:
+                try:
+                    deadline = time.monotonic() + FRAME_TIMEOUT
+                    size = struct.unpack("!I", _recv_exact(conn, 4, deadline))[0]
+                    if not 0 < size <= 256:
+                        raise ProtocolError("worker cancellation exceeds size bound")
+                    value = json.loads(_recv_exact(conn, size, deadline))
+                    if (not isinstance(value, dict)
+                            or value != {"version": 1, "op": "cancel",
+                                         "request_id": request_id}):
+                        raise ProtocolError("worker cancellation does not match request")
+                except (OSError, ValueError, ProtocolError, struct.error, json.JSONDecodeError):
+                    fatal = True
+                else:
+                    fatal = True
+            if fatal:
+                disconnected.set()
+                _kill_process_group(process_group)
+                return
         stop.wait(0.05)
 
 
@@ -1214,7 +1275,24 @@ def _health_error_response() -> dict[str, object]:
 
 
 def read_health(_request: HealthRequest) -> dict[str, object]:
-    return {"version": 2, "op": "health", "ok": True}
+    if not WORKER_SOCKET:
+        return {"version": 2, "op": "health", "ok": True}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as worker:
+            _connect_worker(worker)
+            payload = b'{"version":1,"op":"health"}'
+            worker.sendall(struct.pack("!I", len(payload)) + payload)
+            deadline = time.monotonic() + FRAME_TIMEOUT
+            size = struct.unpack("!I", _recv_exact(worker, 4, deadline))[0]
+            if not 0 < size <= 1024:
+                raise ProtocolError("worker health response is outside size bound")
+            value = json.loads(_recv_exact(worker, size, deadline))
+            if value == {"version": 1, "op": "health", "ok": True}:
+                return {"version": 2, "op": "health", "ok": True}
+    except (OSError, ValueError, ProtocolError, struct.error, json.JSONDecodeError) as exc:
+        print(f"omp-delegate-broker: worker health unavailable: {exc!r}",
+              file=sys.stderr)
+    return _health_error_response()
 
 
 def read_status(request: StatusRequest) -> dict[str, object]:
@@ -1285,6 +1363,154 @@ def run_request(request: Request, conn: socket.socket) -> dict[str, object]:
         return response
 
 
+def _worker_request_value(request: Request) -> dict[str, object]:
+    raw = {
+        "version": 1, "request_id": request.request_id,
+        "task_id": request.task_id, "repository": request.repository,
+        "caller": request.caller, "workspace": str(request.workspace),
+        "sandbox": request.sandbox, "model": request.model,
+        "prompt": request.prompt, "timeout": request.timeout,
+    }
+    derived = dataclasses.asdict(request)
+    for key in (*REQUEST_FIELDS, "protocol_version", "reexecuted"):
+        derived.pop(key, None)
+    derived.pop("workspace", None)
+    return {"version": 1, "op": "execute", "request": raw,
+            "constraints": derived, "reexecuted": request.reexecuted}
+
+
+def _valid_worker_response(value: object, request: Request) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != RESPONSE_FIELDS:
+        raise ProtocolError("worker response fields do not match the protocol")
+    if value["version"] != request.protocol_version or value["request_id"] != request.request_id:
+        raise ProtocolError("worker response correlation does not match")
+    if (isinstance(value["exit_code"], bool)
+            or not isinstance(value["exit_code"], int)
+            or not -255 <= value["exit_code"] <= 255
+            or not isinstance(value["stdout"], str)
+            or not isinstance(value["stderr"], str)
+            or not isinstance(value["timed_out"], bool)
+            or not isinstance(value["process_group_clear"], bool)):
+        raise ProtocolError("worker response types do not match the protocol")
+    if (value["final"] is not None
+            and _valid_final_value(value["final"], caller=request.caller) is None):
+        raise ProtocolError("worker final is not valid for the caller")
+    return value
+
+
+def _trusted_worker_socket() -> None:
+    """Systemd owns the listener; SO_PEERCRED on a client sees PID 1, not accept()."""
+    path = Path(WORKER_SOCKET)
+    if not path.is_absolute():
+        raise ProtocolError("worker socket path is not absolute")
+    parent = os.lstat(path.parent)
+    if (not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != 0 or parent.st_gid != 0
+            or stat.S_IMODE(parent.st_mode) != 0o755
+            or "system.posix_acl_access" in os.listxattr(path.parent, follow_symlinks=False)):
+        raise ProtocolError("worker socket directory is not root-controlled")
+    node = os.lstat(path)
+    try:
+        worker_uid = pwd.getpwnam(WORKER_USER).pw_uid
+    except KeyError as exc:
+        raise ProtocolError("worker identity is unavailable") from exc
+    if (not stat.S_ISSOCK(node.st_mode)
+            or node.st_uid != worker_uid
+            or node.st_gid != os.getegid()
+            or stat.S_IMODE(node.st_mode) != 0o660):
+        raise ProtocolError("worker socket node ownership does not match")
+
+
+def _connect_worker(worker: socket.socket) -> None:
+    worker.settimeout(FRAME_TIMEOUT)
+    _trusted_worker_socket()
+    worker.connect(WORKER_SOCKET)
+    # Client SO_PEERCRED sees systemd, the root listener creator; the
+    # worker's UID is checked on the root-controlled socket node above.
+    if _peer_uid(worker) != 0:
+        raise ProtocolError("worker endpoint identity does not match")
+
+
+def _run_isolated_request(request: Request, upstream: socket.socket) -> dict[str, object]:
+    """Broker keeps its own receipt; only the worker can start/stop OMP."""
+    request_id = request.request_id
+    JOB_STORE.launching(request_id)
+    # No local PID can establish that a remote child died. Preserve launch
+    # uncertainty across disconnects/restarts so a spent lease cannot replay.
+    JOB_STORE.running_external(request_id)
+    disconnected = threading.Event()
+    stop = threading.Event()
+    worker = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    watcher: threading.Thread | None = None
+    try:
+        _connect_worker(worker)
+        payload = json.dumps(_worker_request_value(request), separators=(",", ":")).encode()
+        if not 0 < len(payload) <= MAX_REQUEST_BYTES:
+            raise ProtocolError("worker request exceeds size bound")
+        worker.sendall(struct.pack("!I", len(payload)) + payload)
+
+
+        def watch_upstream() -> None:
+            poller = select.poll()
+            poller.register(upstream, select.POLLHUP | select.POLLERR | select.POLLNVAL)
+            while not stop.is_set():
+                if poller.poll(50):
+                    disconnected.set()
+                    try:
+                        frame = json.dumps(
+                            {"version": 1, "op": "cancel",
+                             "request_id": request_id}, separators=(",", ":")).encode()
+                        worker.sendall(struct.pack("!I", len(frame)) + frame)
+                    except OSError:
+                        try:
+                            worker.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                    return
+
+        watcher = threading.Thread(
+            target=watch_upstream, name=f"omp-worker-{request_id}", daemon=True)
+        watcher.start()
+        deadline = time.monotonic() + request.timeout + 20
+        size = struct.unpack("!I", _recv_exact(worker, 4, deadline))[0]
+        if not 0 < size <= MAX_RESPONSE_BYTES:
+            raise ProtocolError("worker response exceeds size bound")
+        response = _valid_worker_response(
+            json.loads(_recv_exact(worker, size, deadline)), request)
+    except (OSError, ValueError, ProtocolError, struct.error, json.JSONDecodeError) as exc:
+        print(f"omp-delegate-broker: isolated worker unavailable: {exc!r}",
+              file=sys.stderr)
+        response = _error_response(
+            "isolated worker unavailable", request_id=request_id,
+            version=request.protocol_version)
+        response["process_group_clear"] = False
+        status = "orphaned"
+    else:
+        status = (
+            "timed_out" if response["timed_out"]
+            else "cancelled" if disconnected.is_set()
+            else "completed" if response["exit_code"] == 0
+            and response["process_group_clear"] and response["final"] is not None
+            else "failed")
+    finally:
+        stop.set()
+        try:
+            worker.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        if watcher is not None:
+            watcher.join(timeout=2)
+        # If the sender is still blocked, its thread retains the socket object.
+        # Closing it here could recycle its fd into an unrelated connection.
+        if watcher is None or not watcher.is_alive():
+            worker.close()
+    _audit_safely(
+        request_id=request_id, caller=request.caller, workspace=request.workspace,
+        outcome=status, usage={})
+    JOB_STORE.finish(request_id, status, response)
+    return response
+
+
 def _run_request_inner(request: Request, conn: socket.socket) -> dict[str, object]:
     request_id = request.request_id
     try:
@@ -1298,6 +1524,12 @@ def _run_request_inner(request: Request, conn: socket.socket) -> dict[str, objec
             str(exc), request_id=request_id, version=request.protocol_version)
         JOB_STORE.finish(request_id, "rejected", response)
         return response
+    if WORKER_SOCKET:
+        try:
+            return _run_isolated_request(request, conn)
+        finally:
+            lock.close()
+
 
     try:
         provider_api_keys = resolve_provider_api_keys(request)
@@ -1356,7 +1588,7 @@ def _run_request_inner(request: Request, conn: socket.socket) -> dict[str, objec
             disconnected = threading.Event()
             watcher = threading.Thread(
                 target=_watch_client_lifetime,
-                args=(conn, process.pid, stop_watcher, disconnected),
+                args=(conn, process.pid, stop_watcher, disconnected, request_id),
                 name=f"omp-client-{request_id}",
                 daemon=True,
             )

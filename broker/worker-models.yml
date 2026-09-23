@@ -1,0 +1,13 @@
+# OMP requires apiKey for a custom provider; the CLI credential FD must override
+# this deliberately invalid sentinel. The synthetic gateway test proves precedence.
+providers:
+  gateway:
+    baseUrl: http://127.0.0.1:4000/v1
+    api: openai-completions
+    apiKey: invalid-without-worker-fd
+    models:
+      - id: bb-plan-glm
+        name: plan glm (gateway)
+        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
+        contextWindow: 131072
+        maxTokens: 16384

@@ -35,6 +35,24 @@ and a reporting failure is fail-soft. Boundary freshness compares those captured
 loaded bytes and process identity with the deployed artifacts; a matching pair
 digest alone is not a complete stamp.
 
+For an isolated worker, the broker records a delegated running job without a
+local process identifier. A caller disconnect sends a bounded cancellation frame;
+the broker keeps the worker socket open until it receives and persists the
+terminal result, including a final written just before cancellation. The worker
+kills its own child process group. A broker restart marks an uncertain external
+run `orphaned` and does not replay it without an operator reconciliation. The
+worker's private job records do not grant lease or status authority.
+
+The worker handles one connection, then exits. Its service declares
+`KillMode=control-group`; verify the service control group has no detached
+child after a live cancellation. Installed OMP 18.2.8 writes native add-ons
+under `HOME` and opens `agent.db` beside `models.yml`. Keep the catalog
+directory root-owned and read-only to the worker; a root-owned database
+symlink points into the worker service's fresh `PrivateTmp` namespace. Point
+OMP's `HOME` into that namespace too, so an earlier job cannot poison a
+later job's add-on or database. A precreated database in a read-only catalog
+directory failed schema initialization in the local mock check.
+
 ## Cancellation, timeout, and restart
 
 Cancellation and timeout must terminate confirmed descendants of the recorded
@@ -96,22 +114,23 @@ precedes credential resolution, job creation, audit output, or child-process
 creation; the broker never rewrites the issued record, so a policy rejection
 leaves the lease unconsumed. A torn tombstone remains a replay denial.
 Completion, failure, timeout, disconnect, and delivery failure do not make the
-capability reusable. A restart or fault that leaves the job without a result row,
-and a client-disconnect cancellation whose result envelope carries no final, each
-admit exactly one re-execution of the spent lease, tracked by a `reexecuted`
-flag in the job record, only when the caller's pinned model and every fallback rung
-are positively listed in the policy's exact top-level `replay_safe_models` list.
+capability reusable. For an in-broker execution, a resultless pending job or
+client-disconnect cancellation can admit one re-execution when the job is
+not launch-uncertain and the caller's pinned model and every fallback rung
+appear in the policy's exact `replay_safe_models` list. An isolated worker
+launch stays uncertain until its terminal receipt. If that receipt is lost,
+the broker keeps the job orphaned and refuses automatic re-execution.
 Missing, empty, malformed, wildcard, or unknown entries deny re-execution; there
 is no compatibility alias for the former `metered_models` field. Status joins the
 immutable issued record with its valid consumed tombstone. The execution deadline
 controls whether re-execution may be armed; status remains readable after expiry,
 and a terminal job whose result carries a final never re-executes.
 The launcher replays a validated durable terminal result before checking current
-dispatch-model admission. A validated `orphaned` resultless status, or the typed
-`job unavailable` status error, may trigger the one-shot execute attempt; pending
-or running statuses remain pending, and malformed or ambiguous status never arms
-execution. Corrupt or phase-less result records block with their path and parser
-cause rather than reading as absent.
+dispatch-model admission. A validated `orphaned` resultless status or typed
+`job unavailable` status error can cause one execute attempt. The broker still
+refuses that attempt when an isolated worker launch is uncertain. Pending or
+running statuses remain pending. Malformed, corrupt or phase-less records
+block with their path and parser cause rather than reading as absent.
 
 Protocol-v2 errors use exact four-field envelopes:
 `{"version":2,"op":"execute"|"status","ok":false,"error":...}`. A pre-admission
@@ -123,12 +142,15 @@ reexecute. Ordinary child failures, malformed envelopes, transport failures,
 and post-processing failures remain generic. Protocol-v1 responses retain their
 existing format and behavior.
 
-Protocol v2 health is a no-spend live canary. The launcher sends exactly
-`{"version":2,"op":"health"}` through its mapped endpoint. The broker verifies the endpoint
-and `SO_PEERCRED` UID against `HERMES_OMP_ENDPOINT_USERS`, then returns exactly
-`{"version":2,"op":"health","ok":true}`. Health does not read or write leases, jobs, audit
-records, credentials, workspace state, or OMP state. A mismatched or malformed health
-request returns only `{"version":2,"op":"health","ok":false,"error":"endpoint unavailable"}`.
+Protocol-v2 health is a no-model, no-lease readiness probe. The launcher sends
+`{"version":2,"op":"health"}` through its mapped endpoint. The broker binds the
+endpoint and peer identity without creating a job. For a separate worker, it
+checks the root-controlled socket, then asks the worker to validate its
+root-installed runtime and scoped credential file without launching OMP.
+Missing or invalid worker credentials make health unavailable before a lease is
+issued. No credential content crosses the broker socket. Other endpoints retain
+their local health check. An unavailable endpoint returns only
+`{"version":2,"op":"health","ok":false,"error":"endpoint unavailable"}`.
 
 The service units that activate protocol v2 must provide all of the following dependencies:
 

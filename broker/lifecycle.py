@@ -703,6 +703,14 @@ class JobStore:
                       launch_uncertain=False, updated_at=int(time.time()))
         self._write(record)
 
+    def running_external(self, request_id: str) -> None:
+        """An external worker may have started; never replay without its receipt."""
+        record = self.get(request_id)
+        if not record.get("launch_uncertain") or record.get("status") != "pending":
+            raise ValueError("external worker launch was not marked uncertain")
+        record.update(status="running", updated_at=int(time.time()))
+        self._write(record)
+
     def finish(self, request_id: str, status: str, result: dict[str, Any]) -> None:
         if status not in TERMINAL:
             raise ValueError("invalid terminal status")

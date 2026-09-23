@@ -14,10 +14,12 @@ The broker installs independently of [`hermes-mailbox`](https://github.com/ghost
 
 Reference implementation extracted from a deployed private system. The deterministic suite covers client framing and typed finals, clean-baseline admission, repository-key rejection, bounded tool policy, workspace escapes, networkless bash, typed finalization, durable pre-launch records, cancellation state, orphan recovery, delivery-failure result retention, and package metadata. Live clean-install, disposable cancellation/restart, and retained-result scenarios remain unexercised by this reusable package; run them against each deployment before relying on those paths.
 
-The Hermes-facing protocol-v2 issuer repair is source-only as of 2026-09-23. The
-dedicated issuer, private broker endpoint, and one-repository canary require a
-separate operator trust decision, root deployment, and a real-job acceptance window.
-No source fixture proves the `ghosty` model child cannot read its home credentials.
+The Hermes-facing protocol-v2 issuer and isolated worker are source-only.
+The worker receives a single provider key through a service credential mount
+and runs OMP under a separate identity. A synthetic local gateway verifies
+credential-descriptor precedence; source fixtures do not prove operating-system
+permission denial or a real model run. Install the root-owned worker runtime,
+scoped key and units only after a separate operator deployment decision.
 
 ## Boundary
 

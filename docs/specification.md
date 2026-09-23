@@ -110,7 +110,28 @@ The shipped reference implementation uses one-shot `omp -p` plus the trusted `br
 
 Run Hermes as a restricted service account and OMP as the operator/coding account. A local Unix socket or loopback service owned by the operator accepts typed jobs. File permissions allow Hermes to connect to that socket but not read OMP's config/auth database.
 
-The broker validates the repository key and launches OMP. Hermes never executes `sudo -u`, reads the operator home, or receives provider tokens.
+For a single-identity broker, the broker validates the repository key and launches OMP. Hermes never executes `sudo -u`, reads the operator home, or receives provider tokens.
+
+### Isolated model worker
+
+In the isolated deployment, the broker records admission and lifecycle evidence,
+then forwards only its fixed request and derived constraints to a separate
+system service. The service revalidates the one-repository policy and starts OMP
+under a dedicated worker identity. Its root-owned binary, extension and
+single-model catalog are outside broker and worker write paths. The broker
+cannot read the worker's [systemd service credential](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#LoadCredential=)
+or signal the worker-owned child. The worker reads its scoped gateway key from
+`$CREDENTIALS_DIRECTORY` and supplies it through
+`--provider-api-keys-fd`; neither unit stores the key in an environment variable.
+The worker declares loopback-only network access so the model can reach its
+local gateway without direct external IP egress. [Systemd's IP filters](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html#IPAddressAllow=)
+can be unavailable on some kernels; verify the resolved network restriction
+from the live worker before treating it as an enforced boundary.
+The catalog uses a deliberately invalid validation key because installed OMP
+requires an `apiKey` for a custom provider. A local completion mock must
+verify that OMP 18.2.8 sends the descriptor key, and rejects the catalog key
+when the descriptor is absent. That test does not prove live access denial or
+authorize a real model call.
 
 ### OMP auth broker and auth gateway
 
