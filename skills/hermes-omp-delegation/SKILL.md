@@ -12,6 +12,7 @@ The broker is an execution boundary, not a general message channel. It accepts s
 - Confirm the task ledger identifier and the repository key admitted by deployment policy.
 - Use native Hermes coding only when that is the authorized surface. Use the broker when a bounded OMP implementation/review is selected or the caller intentionally has no write tools.
 - Start writing work only from a clean attributable Git baseline. Preserve existing work in a commit or separate worktree.
+- Call `delegate_to_omp` at most once per Hermes turn. The first attempt consumes that turn even if ingress refuses it. Never change the brief or task ID and retry in the same turn; report the first result and obtain a new authorized turn.
 
 ## Brief contract
 
@@ -22,7 +23,7 @@ State the goal, files or subsystem in scope, constraints, observable definition 
 Treat the model summary as a claim. Prefer broker-observed status, changed paths, commits, verification exits, policy decisions, and cleanup evidence. Report disagreements rather than smoothing them over.
 
 - `completed`: compare evidence to every acceptance criterion.
-- `rejected`: correct the request only if policy permits; never widen policy from the caller.
+- `rejected`: report the first refusal. Correct the request only in a new authorized turn when policy permits; never widen policy from the caller.
 - `failed` or `timed_out`: preserve dirty evidence and identify the failed criterion.
 - `cancelled`: confirm descendants ended and cleanup state is recorded.
 - `orphaned`: stop automatic retries; operator reviews preserved state.

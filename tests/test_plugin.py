@@ -214,6 +214,105 @@ class TestOmpDelegateAdmission(unittest.TestCase):
             self.assertEqual("baseline\ndelegate edit\n", seed.read_text())
             self.assertIn("exit code: 0", result.lower())
 
+    def test_one_delegate_dispatch_per_turn_even_when_model_changes_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, seed, marker = self._fixture(root, committed=True)
+            invoke = root / "fake-invoke.py"
+            invoke.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                f"marker = Path({str(marker)!r})\n"
+                "marker.write_text(marker.read_text() + 'x' if marker.exists() else 'x')\n"
+                "print('fixture completed')\n"
+            )
+            invoke.chmod(0o755)
+
+            class Context:
+                def __init__(self) -> None:
+                    self.tool = None
+                    self.middleware = {}
+
+                def register_tool(self, **kwargs) -> None:
+                    self.tool = kwargs["handler"]
+
+                def register_middleware(self, kind, callback) -> None:
+                    self.middleware[kind] = callback
+
+            context = Context()
+            with (
+                mock.patch.object(self.module, "ALLOWED_REPOS", {"fixture": str(repo)}),
+                mock.patch.object(self.module, "INVOKE", str(invoke)),
+            ):
+                self.module.register(context)
+
+                def call(turn_id: str, args: dict) -> str:
+                    def dispatch(payload):
+                        return context.tool(payload, task_id="framework-task", session_id="session")
+                    middleware = context.middleware.get(
+                        "tool_execution",
+                        lambda *, args, next_call, **_kwargs: next_call(args),
+                    )
+                    return middleware(
+                        tool_name="delegate_to_omp", args=args, original_args=args,
+                        session_id="session", turn_id=turn_id, next_call=dispatch,
+                    )
+
+                first = call("turn-1", {"repo": "fixture", "brief": BRIEF, "task_id": "model-a"})
+                second = call("turn-1", {
+                    "repo": "fixture", "brief": BRIEF + " Change the task again.",
+                    "task_id": "model-b",
+                })
+                next_turn = call("turn-2", {
+                    "repo": "fixture", "brief": BRIEF, "task_id": "model-c",
+                })
+                missing_identity = call("", {
+                    "repo": "fixture", "brief": BRIEF, "task_id": "model-d",
+                })
+                bypass = context.tool(
+                    {"repo": "fixture", "brief": BRIEF, "task_id": "model-e"},
+                    task_id="framework-task", session_id="session",
+                )
+
+            self.assertIn("exit code: 0", first.lower())
+            self.assertIn("already", second.lower())
+            self.assertIn("exit code: 0", next_turn.lower())
+            self.assertIn("missing Hermes turn identity", missing_identity)
+            self.assertIn("missing Hermes turn identity", bypass)
+            self.assertEqual("xx", marker.read_text(), "a second call in the same turn reached the client")
+            self.assertEqual("baseline\n", seed.read_text())
+
+    def test_client_refusal_is_actionable_without_exposing_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, seed, marker = self._fixture(root, committed=True)
+            invoke = root / "fake-invoke.py"
+            invoke.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "print('omp-invoke: broker refused execution', file=sys.stderr)\n"
+                "print('secret-bearing unexpected stderr', file=sys.stderr)\n"
+                "raise SystemExit(1)\n"
+            )
+            invoke.chmod(0o755)
+            result = self._invoke(repo, invoke)
+
+            self.assertIn("exit code: 1", result.lower())
+            self.assertIn("issuer or broker refused execution", result.lower())
+            self.assertIn("do not retry", result.lower())
+            self.assertNotIn("secret-bearing", result)
+            invoke.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "print('secret-bearing unexpected stderr', file=sys.stderr)\n"
+                "raise SystemExit(1)\n"
+            )
+            unknown = self._invoke(repo, invoke)
+            self.assertIn("Client exited without a model summary", unknown)
+            self.assertNotIn("secret-bearing", unknown)
+            self.assertFalse(marker.exists())
+            self.assertEqual("baseline\n", seed.read_text())
+
 
 class TestRepositoryContainment(TestOmpDelegateAdmission):
     """The repository key is a capability boundary, so the refusals need proving.

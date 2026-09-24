@@ -13,8 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 class Context:
     def __init__(self) -> None:
         self.tools = {}
+        self.middleware = {}
+
     def register_tool(self, **kwargs) -> None:
         self.tools[kwargs["name"]] = kwargs
+
+    def register_middleware(self, kind, callback) -> None:
+        self.middleware[kind] = callback
 
 
 class PackageTest(unittest.TestCase):
@@ -33,6 +38,7 @@ class PackageTest(unittest.TestCase):
         context = Context()
         module.register(context)
         self.assertEqual(["delegate_to_omp"], sorted(context.tools))
+        self.assertEqual(["tool_execution"], sorted(context.middleware))
 
     def test_policy_is_configured_from_one_file(self) -> None:
         policy = json.loads((ROOT / "examples/policy.json").read_text())

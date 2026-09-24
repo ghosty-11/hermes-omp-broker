@@ -6,6 +6,7 @@ trusted from model prose.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ import socket
 import stat
 import struct
 import subprocess
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -220,6 +222,17 @@ def _handle(args: dict, **_kwargs: Any) -> str:
         )
         summary = (proc.stdout or "").strip()
         rc = proc.returncode
+        if rc != 0 and not summary:
+            if "omp-invoke: broker refused execution" in (proc.stderr or "").splitlines():
+                summary = (
+                    "Issuer or broker refused execution; do not retry this turn. "
+                    "Check issuer Git access and the dedicated job record."
+                )
+            else:
+                summary = (
+                    "Client exited without a model summary; do not retry this turn. "
+                    "Inspect the client error under operator control."
+                )
     except Exception as e:
         logger.exception("delegate_to_omp: invocation failed")
         return f"delegate_to_omp: could not start the run ({type(e).__name__}). Nothing was changed."
@@ -265,7 +278,7 @@ def _handle(args: dict, **_kwargs: Any) -> str:
     lines = [
         f"DELEGATED RUN — repository: {repo_name}, exit code: {rc}",
         "",
-        "MODEL SUMMARY (a claim, not evidence):",
+        "MODEL SUMMARY (a claim, not evidence):" if rc == 0 else "CLIENT STATUS (not a model result):",
         summary or "(no output)",
         "",
         "OBSERVED EVIDENCE — attributable to THIS run:",
@@ -328,12 +341,48 @@ _SCHEMA = {
 
 
 def register(ctx) -> None:
+    # Middleware supplies Hermes's turn ID; the handler refuses if middleware
+    # was skipped or failed open. Model-supplied task_id never keys this limit.
+    active_turn: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+        "omp_delegate_turn", default=None,
+    )
+    attempted_turns: set[tuple[str, str]] = set()
+    lock = threading.Lock()
+
+    def bind_turn(*, tool_name: str, args: dict, next_call,
+                  session_id: str = "", turn_id: str = "", **_kwargs):
+        if tool_name != _SCHEMA["name"]:
+            return next_call(args)
+        if not session_id or not turn_id:
+            return "delegate_to_omp: missing Hermes turn identity; delegation refused."
+        token = active_turn.set((session_id, turn_id))
+        try:
+            return next_call(args)
+        finally:
+            active_turn.reset(token)
+
+    def guarded_handle(args: dict, *, session_id: str = "", **kwargs) -> str:
+        identity = active_turn.get()
+        if identity is None or identity[0] != session_id:
+            return "delegate_to_omp: missing Hermes turn identity; delegation refused."
+        with lock:
+            if identity in attempted_turns:
+                return (
+                    "delegate_to_omp: this turn already attempted a delegation. "
+                    "Do not retry; report its first result or ask the operator for a new turn."
+                )
+            attempted_turns.add(identity)
+        return _handle(args, **kwargs)
+
     try:
+        # Register the gate first; its handler half also fails closed when
+        # Hermes skips a throwing middleware frame.
+        ctx.register_middleware("tool_execution", bind_turn)
         ctx.register_tool(
             name=_SCHEMA["name"],
             toolset="omp_delegate",
             schema=_SCHEMA,
-            handler=_handle,
+            handler=guarded_handle,
             check_fn=_available,
             description=_SCHEMA["description"],
         )
