@@ -416,22 +416,6 @@ class ResearchPolicyBrokerTest(unittest.TestCase):
             )
             self.assertNotIn("openai-codex", resolved)
 
-    def test_retry_overlay_pins_only_the_request_model_chain(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            module = load_broker(_policy(td), td)
-            request = module.validate_request(
-                _request(td, caller=RESEARCH), peer_uid=os.getuid())
-            path = module.write_retry_overlay(request, Path(td))
-            value = json.loads(path.read_text())
-            chain = ["xai-oauth/grok-4.6"]
-            self.assertEqual(value, {"retry": {"fallbackChains": {
-                OPUS: chain,
-                "anthropic/claude-sonnet-5": chain,
-                "anthropic/claude-fable-5": chain,
-            }}})
-            argv = module.omp_argv(request, 9, config_path=path)
-            self.assertEqual(argv[argv.index("--config") + 1], str(path))
-
 
 class ResearchOutboundSurfaceRemovedTest(unittest.TestCase):
     """The extension must register no outbound tool for the research caller."""

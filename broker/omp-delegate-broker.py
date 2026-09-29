@@ -766,14 +766,32 @@ def validate_request(value: object, *, peer_uid: int | None) -> Request:
 
 
 def write_retry_overlay(request: Request, directory: Path) -> Path:
-    """Write a private per-request exact-model chain; shared config cannot widen it."""
+    """Write a private per-request overlay: the exact model chain, speculative
+    launch off, and web search pinned to the SearXNG role with an empty web
+    fallback chain.
+
+    omp_argv launches the child with --no-project-settings and
+    --replace-fallback-chains, so the retry.fallbackChains record written here
+    replaces the effective global/project record wholesale instead of
+    deep-merging with it: no shared or workspace setting can widen, add or
+    keep a chain of its own. Every key the resolver can still select on — the
+    pinned model, each validated rung, each caller selector — carries the same
+    broker-validated chain, and the catch-all default and web keys are empty,
+    so effort-exact, wildcard and default lookups land inside the validated
+    chain or nowhere."""
     chain = list(fallback_models(request))
-    selectors = list(dict.fromkeys((request.model, *request.fallback_selectors)))
+    pinned = list(dict.fromkeys(
+        (request.model, *chain, *request.fallback_selectors)
+    ))
     path = directory / "retry-overlay.json"
     value = {
+        "task": {"speculativeLaunch": False},
+        "modelRoles": {"web": "web/searxng"},
         "retry": {
             "fallbackChains": {
-                selector: chain for selector in selectors
+                **{selector: chain for selector in pinned},
+                "default": [],
+                "web": [],
             },
         },
     }
@@ -789,7 +807,16 @@ def omp_argv(request: Request, credential_fd: int,
         if request.skills
         else ["--no-skills"]
     )
-    config_args = ["--config", str(config_path)] if config_path is not None else []
+    # Per-job isolation contract: workspace project settings are skipped
+    # entirely, and the retry overlay's fallbackChains record replaces the
+    # lower layers instead of deep-merging with them. The replacement flag
+    # fails closed without the explicit --config overlay it follows.
+    config_args = (
+        ["--config", str(config_path), "--no-project-settings",
+         "--replace-fallback-chains"]
+        if config_path is not None
+        else []
+    )
     return [
         str(OMP_BIN),
         "-p",
