@@ -5,7 +5,7 @@ Policy is server-owned configuration. Repository keys map to paths. Caller entri
 One `model` admits jobs globally. A caller entry may pin its own `model`, which then
 replaces the global one for that caller only — this is per-caller pinning, not a role
 system; the request still names the model explicitly and a mismatch is rejected before
-OMP starts. A caller entry may also raise its own `max_timeout` ceiling in seconds; the
+Oh My Pi (OMP) starts. A caller entry may also raise its own `max_timeout` ceiling in seconds; the
 broker bounds it at 3600 regardless of policy, and callers without one keep the 810
 default. A caller entry may list `fallback_models` as `provider/model` ids. The broker mints
 credentials only for the pinned model and those rungs, then writes a mode-0600 per-request
@@ -16,11 +16,25 @@ chain that other callers could inherit. Callers without `fallback_models` keep t
 service-wide default. Invalid entries fail before OMP starts. The request cannot supply or
 widen model, timeout, selectors, or fallback chain.
 
+The optional server-owned `restricted_model: true` field admits only the
+caller's explicit primary model and requires `fallback_models: []`.
+Fallback selectors cannot name another model. The broker disables model
+fallback, advisor execution and speculative launch in the private overlay.
+The trusted extension forbids children and refuses tool use without the
+expected served-model identity. Unmarked callers keep their existing policy.
+
+Restricted runs retain their private session history. Before accepting a
+typed final, the broker requires one complete bounded session trace whose
+model transitions and assistant identities all match the primary. A later
+matching final cannot erase an earlier off-primary span. Missing or invalid
+history fails the job. This check does not grant provider credentials or
+add a model to the resultless-replay inventory.
+
 The broker copies the admitted caller name into the child as `OMP_DELEGATE_CALLER`. The
 trusted extension uses that name to choose the tool surface. Callers that do not name a
 research surface keep the existing workspace tools. `backlog-maturation` stays
 restricted-write and cannot call `task`, `backlog_search`, or `backlog_fetch`.
-`backlog-maturation-research` may read admitted staging/Wiki/media roots, write only its
+Unless `restricted_model` forbids children, `backlog-maturation-research` may read admitted staging/Wiki/media roots, write only its
 restricted staging patterns, call `todo` and `broker_finalize`, and invoke at most five
 allowlisted research agents (`backlog-researcher`, `backlog-vision`, and at most one
 `backlog-researcher-max`). Their operator-owned definitions must carry `blocking: true`;

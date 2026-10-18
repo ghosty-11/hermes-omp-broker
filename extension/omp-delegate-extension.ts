@@ -99,6 +99,11 @@ function isReviewCaller(): boolean {
 function usesStructuredResult(): boolean {
   return process.env.OMP_DELEGATE_STRUCTURED_RESULT === "1";
 }
+function restrictedExpectedModel(): string | undefined {
+  return process.env.OMP_DELEGATE_NO_CHILDREN === "1"
+    ? process.env.OMP_DELEGATE_EXPECTED_MODEL
+    : undefined;
+}
 
 
 
@@ -740,6 +745,15 @@ export default function ompDelegateExtension(pi: PiApi): void {
   pi.on("tool_call", (event, context) => {
     const name = typeof event.toolName === "string" ? event.toolName : "";
     const research = isResearchCaller();
+    const expected = restrictedExpectedModel();
+    if (process.env.OMP_DELEGATE_NO_CHILDREN === "1") {
+      if (name === "task" || name === "spawn" || name.endsWith("_spawn")) {
+        return blocked("Restricted model run forbids children");
+      }
+      if (!expected || servedModel(context) !== expected) {
+        return blocked("Restricted model run lacks the expected served model");
+      }
+    }
     if (finalized) return blocked("The final result is already recorded; no later tool calls are allowed");
     if (!Object.hasOwn(research ? RESEARCH_TOOLS : ALLOWED_TOOLS, name)) {
       return blocked("Tool is outside the OMP delegation workspace policy");
@@ -831,6 +845,10 @@ export default function ompDelegateExtension(pi: PiApi): void {
     loadMode: "essential",
     deferrable: false,
     async execute(_id: string, params: unknown, _signal?: AbortSignal, _update?: unknown, context?: Context) {
+      const expected = restrictedExpectedModel();
+      if (process.env.OMP_DELEGATE_NO_CHILDREN === "1" && (!expected || servedModel(context) !== expected)) {
+        return { content: [{ type: "text", text: "Final result rejected: restricted served model differs" }], isError: true };
+      }
       if (finalized) {
         return { content: [{ type: "text", text: "Final result was already recorded" }], isError: true };
       }

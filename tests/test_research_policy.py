@@ -44,6 +44,8 @@ def load_broker(policy: dict, td: str):
         "HERMES_OMP_POLICY": str(policy_path),
         "HERMES_OMP_CALLER_UID": str(os.getuid()),
         "HERMES_OMP_JOB_DIR": str(Path(td) / "jobs"),
+        "HERMES_OMP_LOCK_DIR": str(Path(td) / "locks"),
+        "HERMES_OMP_AUDIT_LOG": str(Path(td) / "audit" / "audit.jsonl"),
         "HERMES_OMP_MODEL": "provider/model",
         "HERMES_OMP_FALLBACK_MODELS": "openai-codex/gpt-5.6-luna",
     }):
@@ -156,6 +158,8 @@ class ResearchPolicyExtensionTest(unittest.TestCase):
         sandbox: str = "workspace-write",
         write_patterns: list[str] | None = None,
         git_mode: str = "none",
+        expected_model: str | None = None,
+        served_model: dict[str, str] | None = None,
     ) -> list[object]:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -175,7 +179,7 @@ const pi = {{
 }};
 extension(pi);
 const output: unknown[] = [];
-const ctx = {{cwd:{json.dumps(str(workspace))}}};
+const ctx = {{cwd:{json.dumps(str(workspace))}, model:{json.dumps(served_model)}}};
 for (const event of {json.dumps(events)}) {{
   output.push(await handlers.get("tool_call")!(event, ctx));
 }}
@@ -190,11 +194,37 @@ console.log(JSON.stringify(output));''')
                 "OMP_DELEGATE_CREATE_ONLY": "0",
                 "OMP_DELEGATE_CALLER": caller,
             }
+            env.pop("OMP_DELEGATE_NO_CHILDREN", None)
+            env.pop("OMP_DELEGATE_EXPECTED_MODEL", None)
+            if expected_model is not None:
+                env["OMP_DELEGATE_NO_CHILDREN"] = "1"
+                env["OMP_DELEGATE_EXPECTED_MODEL"] = expected_model
             result = subprocess.run(
                 ["node", str(runner)], env=env, text=True,
                 capture_output=True, check=False)
         self.assertEqual(0, result.returncode, result.stderr)
         return json.loads(result.stdout)
+
+    def test_restricted_research_rejects_children_and_mismatched_tool_context(self) -> None:
+        model = "openai-codex/gpt-6-sol"
+        events = [
+            {"toolName": "task", "input": _valid_batch()},
+            {"toolName": "spawn", "input": {}},
+            {"toolName": "read", "input": {"path": "runs/manifest.json"}},
+            {"toolName": "broker_finalize", "input": {}},
+        ]
+        approved = self.exercise(events, caller=RESEARCH, expected_model=model,
+                                 served_model={"provider": "openai-codex", "id": "gpt-6-sol"})
+        self.assertTrue(approved[0]["block"])
+        self.assertTrue(approved[1]["block"])
+        self.assertIsNone(approved[2])
+        self.assertIsNone(approved[3])
+        for served in (None, {"provider": "gateway", "id": "other"}):
+            results = self.exercise(events, caller=RESEARCH, expected_model=model,
+                                    served_model=served)
+            self.assertTrue(all(result["block"] for result in results))
+        normal = self.exercise([events[0]], caller=RESEARCH)
+        self.assertIsNone(normal[0])
 
     def test_writer_blocks_task_search_and_fetch(self) -> None:
         results = self.exercise([
@@ -321,6 +351,197 @@ console.log(JSON.stringify(output));''')
 
 
 class ResearchPolicyBrokerTest(unittest.TestCase):
+    def test_restricted_model_disables_auxiliary_inference_and_retains_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            policy = _policy(td)
+            entry = policy["callers"][RESEARCH]
+            entry.update(model="openai-codex/gpt-6-sol", fallback_models=[],
+                         fallback_selectors=[], restricted_model=True)
+            module = load_broker(policy, td)
+            payload = _request(td, caller=RESEARCH)
+            payload["model"] = entry["model"]
+            admitted = module.validate_request(payload, peer_uid=os.getuid())
+            overlay_path = module.write_retry_overlay(admitted, Path(td))
+            overlay = json.loads(overlay_path.read_text())
+            self.assertIs(overlay["retry"].get("modelFallback"), False)
+            self.assertIs(overlay["advisor"]["enabled"], False)
+            self.assertEqual((), module.fallback_models(admitted))
+            environment = module.omp_environment(
+                os.environ, final_path=Path(td) / "final.json", request=admitted)
+            self.assertEqual("1", environment["OMP_DELEGATE_NO_CHILDREN"])
+            self.assertEqual(entry["model"], environment["OMP_DELEGATE_EXPECTED_MODEL"])
+            argv = module.omp_argv(admitted, 9, config_path=overlay_path)
+            self.assertNotIn("--no-session", argv)
+            self.assertIn("--session-dir", argv)
+            with self.assertRaises(module.ProtocolError):
+                module.omp_argv(admitted, 9)
+
+    def test_restricted_policy_refuses_implicit_or_cross_model_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            policy = _policy(td)
+            entry = policy["callers"][RESEARCH]
+            entry.update(model="openai-codex/gpt-6-sol", fallback_models=[],
+                         fallback_selectors=[], restricted_model=True)
+            module = load_broker(policy, td)
+            payload = _request(td, caller=RESEARCH)
+            payload["model"] = entry["model"]
+            self.assertTrue(module.validate_request(payload, peer_uid=os.getuid()).restricted_model)
+            for change in (
+                {"restricted_model": "true"},
+                {"model": None},
+                {"fallback_models": None},
+                {"fallback_models": ["gateway/other"]},
+                {"fallback_selectors": ["gateway/other"]},
+            ):
+                with self.subTest(change=change):
+                    saved = dict(entry)
+                    entry.update(change)
+                    with mock.patch.dict(module.CALLER_POLICIES, {RESEARCH: dict(entry)}):
+                        with self.assertRaises(module.ProtocolError):
+                            module.validate_request(payload, peer_uid=os.getuid())
+                    entry.clear()
+                    entry.update(saved)
+            payload["restricted_model"] = False
+            with self.assertRaises(module.ProtocolError):
+                module.validate_request(payload, peer_uid=os.getuid())
+
+    def test_unmarked_caller_keeps_session_and_env_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            module = load_broker(_policy(td), td)
+            request = module.validate_request(
+                _request(td, caller=WRITER), peer_uid=os.getuid())
+            with mock.patch.dict(os.environ, {
+                "OMP_DELEGATE_NO_CHILDREN": "1",
+                "OMP_DELEGATE_EXPECTED_MODEL": "untrusted/model",
+            }):
+                env = module.omp_environment(
+                    os.environ, final_path=Path(td) / "final.json", request=request)
+            self.assertNotIn("OMP_DELEGATE_NO_CHILDREN", env)
+            self.assertNotIn("OMP_DELEGATE_EXPECTED_MODEL", env)
+            overlay = module.write_retry_overlay(request, Path(td))
+            self.assertNotIn("modelFallback", json.loads(overlay.read_text())["retry"])
+            argv = module.omp_argv(request, 9, config_path=overlay)
+            self.assertIn("--no-session", argv)
+            self.assertNotIn("--session-dir", argv)
+
+    def test_restricted_trace_validates_entire_session_tree(self) -> None:
+        expected = "openai-codex/gpt-6-sol"
+        primary = {"type": "model_change", "model": expected}
+        assistant = {"type": "message", "message": {
+            "role": "assistant", "provider": "openai-codex", "model": "gpt-6-sol"}}
+        cases = {
+            "approved": ([{"type": "session"}, primary, assistant], False),
+            "missing_trace": (None, True),
+            "missing_assistant_identity": ([{"type": "session"}, primary, {
+                "type": "message", "message": {"role": "assistant", "model": "gpt-6-sol"}}], True),
+            "offprimary_transition": ([{"type": "session"}, primary,
+                {"type": "model_change", "model": "gateway/other"}, assistant,
+                primary, assistant], True),
+            "offprimary_assistant": ([{"type": "session"}, primary, {
+                "type": "message", "message": {"role": "assistant", "provider": "gateway",
+                                              "model": "other"}}, assistant], True),
+            "incomplete_transition": ([{"type": "session"}, {
+                "type": "model_change", "model": "gpt-6-sol"}, assistant], True),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            module = load_broker(_policy(td), td)
+            for name, (rows, refused) in cases.items():
+                with self.subTest(case=name):
+                    directory = Path(td) / name
+                    directory.mkdir()
+                    if rows is not None:
+                        (directory / "primary.jsonl").write_text(
+                            "".join(json.dumps(row) + "\n" for row in rows))
+                    self.assertEqual(refused, module.validate_restricted_trace(
+                        directory, expected) is not None)
+            extra = Path(td) / "auxiliary"
+            extra.mkdir()
+            for name in ("primary.jsonl", "child.jsonl"):
+                (extra / name).write_text(
+                    "".join(json.dumps(row) + "\n" for row in cases["approved"][0]))
+            self.assertIn("exactly one", module.validate_restricted_trace(extra, expected))
+            corrupt = Path(td) / "corrupt"
+            corrupt.mkdir()
+            (corrupt / "primary.jsonl").write_text("{not json}\n")
+            self.assertIsNotNone(module.validate_restricted_trace(corrupt, expected))
+            nested = Path(td) / "nested"
+            (nested / "child").mkdir(parents=True)
+            (nested / "primary.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in cases["approved"][0]))
+            (nested / "child" / "aux.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in cases["approved"][0]))
+            self.assertIn("exactly one", module.validate_restricted_trace(nested, expected))
+
+    def test_fake_omp_restricted_run_accepts_only_verified_trace(self) -> None:
+        expected = "openai-codex/gpt-6-sol"
+        primary = [{"type": "session"}, {"type": "model_change", "model": expected},
+                   {"type": "message", "message": {
+                       "role": "assistant", "provider": "openai-codex", "model": "gpt-6-sol"}}]
+        scenarios = {
+            "approved": primary,
+            "missing": None,
+            "missing_assistant_identity": [
+                *primary[:2], {"type": "message", "message": {
+                    "role": "assistant", "model": "gpt-6-sol"}}],
+            "offprimary_assistant": [
+                *primary, {"type": "message", "message": {
+                    "role": "assistant", "provider": "gateway", "model": "other"}},
+                primary[-1]],
+            "offprimary_then_return": [
+                *primary, {"type": "model_change", "model": "gateway/other"},
+                {"type": "model_change", "model": expected}, primary[-1]],
+            "auxiliary": [primary, primary],
+            "final_mismatch": primary,
+            "final_missing_identity": primary,
+        }
+        for name, rows in scenarios.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                policy = _policy(td)
+                policy["callers"][RESEARCH].update(
+                    model=expected, fallback_models=[], fallback_selectors=[],
+                    restricted_model=True)
+                module = load_broker(policy, td)
+                payload = _request(td, caller=RESEARCH)
+                payload["model"] = expected
+                request = module.validate_request(payload, peer_uid=os.getuid())
+                fake = Path(td) / "fake-omp"
+                fake.write_text(f'''#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+args = sys.argv
+sessions = Path(args[args.index("--session-dir") + 1])
+sessions.mkdir()
+rows = {rows!r}
+if rows is not None:
+    traces = rows if {name == "auxiliary"!r} else [rows]
+    for index, trace in enumerate(traces):
+        (sessions / f"{{index}}.jsonl").write_text(
+            "".join(json.dumps(item) + "\\n" for item in trace))
+Path(os.environ["OMP_DELEGATE_FINAL_PATH"]).write_text(json.dumps({{
+    "summary": "Fake run with a typed outcome", "verification": ["fixture"],
+    "gaps": [], "verdict": "MET",
+    **({{}} if {name == "final_missing_identity"!r} else
+       {{"served_model": {"gateway/other" if name == "final_mismatch" else expected!r}}})
+}}))
+''')
+                fake.chmod(0o700)
+                with mock.patch.object(module, "OMP_BIN", fake), mock.patch.object(
+                    module, "WORKER_SOCKET", ""), mock.patch.object(
+                    module, "resolve_provider_api_keys", return_value={}
+                ), mock.patch.object(module, "_process_group_exists", return_value=False):
+                    import socket
+                    parent, child = socket.socketpair()
+                    with parent, child:
+                        response = module.run_request(request, child)
+                self.assertEqual(name == "approved", response["final"] is not None)
+                self.assertEqual(name == "approved", response["exit_code"] == 0)
+                self.assertEqual(
+                    "completed" if name == "approved" else "failed",
+                    module.JOB_STORE.get("req")["status"])
+                [retained] = list(module.JOB_STORE.root.glob("restricted-*"))
+                self.assertTrue((retained / "final.json").exists())
+                self.assertTrue((retained / "sessions").is_dir())
+
     def test_policy_caller_identity_reaches_extension_env(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             module = load_broker(_policy(td), td)

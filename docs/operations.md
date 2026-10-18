@@ -213,6 +213,14 @@ research caller pointed at an older extension. Do not roll job state backward ov
 records; retain the pre-rollback copy for reconciliation. The following commands are
 generic protocol-v1 user-unit examples, not a live v2 rollback.
 
+A policy using `restricted_model` requires matching broker and trusted-extension
+support. Restore those bytes and the caller policy together; an older broker
+must not silently ignore the restriction. Preserve restricted-run session
+directories with the job records. Source checks and fixture runs do not prove
+that the executing identity can use a provider. Verify provider eligibility
+under that identity before admitting work; credential expansion needs separate
+authorization.
+
 ```sh
 systemctl --user daemon-reload
 ```

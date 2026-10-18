@@ -25,6 +25,8 @@ class ExtensionTest(unittest.TestCase):
         structured_result: bool = False,
         read_paths: list[str] | None = None,
         want_stderr: bool = False,
+        expected_model: str | None = None,
+        served_model: dict[str, str] | None = None,
     ) -> list[object] | tuple[list[object], str]:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -42,10 +44,10 @@ const handlers = new Map<string, Function>(); const tools = new Map<string, unkn
 const scalar = {{ optional() {{ return this; }}, describe() {{ return this; }} }};
 const pi = {{ zod: {{ string: () => scalar, number: () => scalar, array: (_v: unknown) => scalar, enum: (_v: unknown) => scalar, object: (_v: unknown) => scalar }}, on: (n: string, h: Function) => handlers.set(n,h), registerTool: (t: {{name:string}}) => tools.set(t.name,t) }};
 extension(pi);
-const output: unknown[] = []; const ctx = {{cwd:{json.dumps(str(workspace))}}};
+const output: unknown[] = []; const ctx = {{cwd:{json.dumps(str(workspace))}, model:{json.dumps(served_model)}}};
 for (const event of {json.dumps(events)}) {{
   if (event.kind === "tool_definition") output.push(tools.get(String(event.name)));
-  else if (event.kind === "broker_finalize") output.push(await (tools.get("broker_finalize") as any).execute("id", event.input));
+  else if (event.kind === "broker_finalize") output.push(await (tools.get("broker_finalize") as any).execute("id", event.input, undefined, undefined, ctx));
   else if (event.kind === "final_file") output.push(JSON.parse(readFileSync({json.dumps(str(final))}, "utf8")));
   else if (event.kind === "session_stop") output.push(await handlers.get("session_stop")!(event, ctx) ?? null);
   else output.push(await handlers.get("tool_call")!(event,ctx));
@@ -63,6 +65,11 @@ console.log(JSON.stringify(output));''')
                 "OMP_DELEGATE_HOOKLESS_COMMIT": "1" if hookless_commit else "0",
                 "OMP_DELEGATE_STRUCTURED_RESULT": "1" if structured_result else "0",
             }
+            env.pop("OMP_DELEGATE_NO_CHILDREN", None)
+            env.pop("OMP_DELEGATE_EXPECTED_MODEL", None)
+            if expected_model is not None:
+                env["OMP_DELEGATE_NO_CHILDREN"] = "1"
+                env["OMP_DELEGATE_EXPECTED_MODEL"] = expected_model
             result = subprocess.run(["node", str(runner)], env=env, text=True, capture_output=True, check=False)
         self.assertEqual(0, result.returncode, result.stderr)
         parsed = json.loads(result.stdout)
@@ -89,6 +96,21 @@ console.log(JSON.stringify(buildSandboxArgv({json.dumps(command)}, {json.dumps(s
                 capture_output=True, check=False)
         self.assertEqual(0, result.returncode, result.stderr)
         return json.loads(result.stdout)
+
+    def test_restricted_finalize_requires_primary_context_even_without_tool_hook(self) -> None:
+        final = {"summary": "Fixture records a restricted result",
+                 "verification": "fixture", "gaps": "", "verdict": "MET"}
+        events = [{"kind": "broker_finalize", "input": final}]
+        for model in (None, {"provider": "gateway", "id": "other"}):
+            with self.subTest(model=model):
+                result = self.exercise(events, expected_model="openai-codex/gpt-6-sol",
+                                       served_model=model)
+                self.assertTrue(result[0]["isError"])
+        accepted = self.exercise(events + [{"kind": "final_file"}],
+                                 expected_model="openai-codex/gpt-6-sol",
+                                 served_model={"provider": "openai-codex", "id": "gpt-6-sol"})
+        self.assertFalse(accepted[0].get("isError", False))
+        self.assertEqual("openai-codex/gpt-6-sol", accepted[1]["served_model"])
 
     def test_dropped_read_roots_are_loud(self) -> None:
         """A granted read root the worker cannot use must be REFUSED LOUDLY on

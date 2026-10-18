@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import fcntl
@@ -397,6 +398,7 @@ class Request:
     structured_result: bool = False
     fallback_models: tuple[str, ...] | None = None
     fallback_selectors: tuple[str, ...] = ()
+    restricted_model: bool = False
     protocol_version: int = 1
     reexecuted: bool = False
 
@@ -706,6 +708,16 @@ def validate_request(value: object, *, peer_uid: int | None) -> Request:
     workspace = requested_workspace.resolve()
     admitted = REPOSITORY_PATHS.get(value["repository"])
     caller_policy = CALLER_POLICIES[caller]
+    restricted = caller_policy.get("restricted_model", False)
+    if not isinstance(restricted, bool):
+        raise ProtocolError("caller restricted_model policy is invalid")
+    if restricted and (
+        not isinstance(caller_policy.get("model"), str)
+        or not _valid_fallback_model(caller_policy["model"])
+        or caller_policy["model"] != caller_policy["model"].strip()
+        or caller_policy.get("fallback_models") != []
+    ):
+        raise ProtocolError("restricted_model requires an explicit primary and empty fallback_models")
     rooted, root_mapped = caller_workspace_root_membership(
         caller_policy, value["repository"], requested_workspace, admitted)
     allowed = {path.resolve() for path in ALLOWED_WORKSPACES[caller]}
@@ -755,6 +767,8 @@ def validate_request(value: object, *, peer_uid: int | None) -> Request:
     fallback_selectors = _string_tuple("fallback_selectors")
     if any(not _valid_fallback_model(item) for item in fallback_selectors):
         raise ProtocolError("caller fallback_selectors policy is invalid")
+    if restricted and any(item != value["model"] for item in fallback_selectors):
+        raise ProtocolError("restricted_model forbids nonprimary fallback_selectors")
     return Request(
         value["request_id"], value["task_id"], value["repository"], caller, workspace,
         value["sandbox"], value["model"], prompt, timeout,
@@ -762,6 +776,7 @@ def validate_request(value: object, *, peer_uid: int | None) -> Request:
         str(git_mode), _string_tuple("skills"), create_only,
         hookless_commit, structured_result,
         _caller_fallback_models(caller_policy), fallback_selectors,
+        restricted_model=restricted,
     )
 
 
@@ -795,6 +810,9 @@ def write_retry_overlay(request: Request, directory: Path) -> Path:
             },
         },
     }
+    if request.restricted_model:
+        value["retry"]["modelFallback"] = False
+        value["advisor"] = {"enabled": False}
     path.write_text(json.dumps(value, separators=(",", ":")) + "\n", encoding="utf-8")
     os.chmod(path, 0o600)
     return path
@@ -807,6 +825,8 @@ def omp_argv(request: Request, credential_fd: int,
         if request.skills
         else ["--no-skills"]
     )
+    if request.restricted_model and config_path is None:
+        raise ProtocolError("restricted_model requires a private config overlay")
     # Per-job isolation contract: workspace project settings are skipped
     # entirely, and the retry overlay's fallbackChains record replaces the
     # lower layers instead of deep-merging with them. The replacement flag
@@ -820,7 +840,8 @@ def omp_argv(request: Request, credential_fd: int,
     return [
         str(OMP_BIN),
         "-p",
-        "--no-session",
+        *(["--session-dir", str(config_path.parent / "sessions")]
+          if request.restricted_model else ["--no-session"]),
         "--no-title",
         "--no-prewalk",
         "--no-extensions",
@@ -861,6 +882,9 @@ def omp_environment(
         "OMP_DELEGATE_CALLER": request.caller,
         "OMP_DELEGATE_STRUCTURED_RESULT": "1" if request.structured_result else "0",
     }
+    if request.restricted_model:
+        env["OMP_DELEGATE_NO_CHILDREN"] = "1"
+        env["OMP_DELEGATE_EXPECTED_MODEL"] = request.model
     if request.git_mode == "scoped":
         env.update({
             "GIT_CONFIG_COUNT": "1",
@@ -1137,6 +1161,63 @@ def _valid_structured_result(value: object) -> bool:
     except json.JSONDecodeError:
         return False
     return isinstance(parsed, dict)
+
+
+def validate_restricted_trace(directory: Path, expected_model: str) -> str | None:
+    """Refuse unless the one retained OMP session stayed on the primary."""
+    try:
+        traces: list[Path] = []
+        if not directory.is_dir() or directory.is_symlink():
+            return "restricted session directory is missing or unsafe"
+        visited = 0
+        def fail_walk(error: OSError) -> None:
+            raise error
+        for root, dirs, files in os.walk(
+                directory, followlinks=False, onerror=fail_walk):
+            visited += 1 + len(dirs) + len(files)
+            if visited > 128 or len(traces) + len(files) > 128:
+                return "restricted session tree exceeds the inspection bound"
+            for name in dirs:
+                if (Path(root) / name).is_symlink():
+                    return "restricted session tree contains a symlink"
+            for name in files:
+                path = Path(root) / name
+                if path.is_symlink() or not path.is_file() or path.suffix != ".jsonl":
+                    return "restricted session tree contains an unexpected file"
+                traces.append(path)
+        if len(traces) != 1:
+            return "restricted run requires exactly one session trace"
+        if traces[0].stat().st_size > 32_000_000:
+            return "restricted session trace exceeds the inspection bound"
+        transitions = assistants = sessions = 0
+        with traces[0].open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if line_number > 100_000 or len(line) > 1_000_000:
+                    return "restricted session trace exceeds the inspection bound"
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    return "restricted session trace contains an invalid entry"
+                if row.get("type") == "session":
+                    sessions += 1
+                elif row.get("type") == "model_change":
+                    transitions += 1
+                    if row.get("model") != expected_model:
+                        return f"restricted session model transition differs at line {line_number}"
+                elif row.get("type") == "message":
+                    message = row.get("message")
+                    if not isinstance(message, dict):
+                        return f"restricted session message is invalid at line {line_number}"
+                    if message.get("role") == "assistant":
+                        assistants += 1
+                        if (not isinstance(message.get("provider"), str)
+                                or not isinstance(message.get("model"), str)
+                                or f'{message["provider"]}/{message["model"]}' != expected_model):
+                            return f"restricted assistant identity differs at line {line_number}"
+        if sessions != 1 or not transitions or not assistants:
+            return "restricted session has incomplete execution identity"
+        return None
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        return f"restricted session trace unreadable: {type(exc).__name__}"
 
 
 def _valid_final(path: Path, *, caller: str) -> dict[str, object] | None:
@@ -1573,7 +1654,13 @@ def _run_request_inner(request: Request, conn: socket.socket) -> dict[str, objec
 
     global _ACTIVE_PROCESS_GROUP
     try:
-        with tempfile.TemporaryDirectory(prefix="omp-delegate-broker-") as td:
+        private = (
+            contextlib.nullcontext(tempfile.mkdtemp(
+                prefix="restricted-", dir=JOB_STORE.root))
+            if request.restricted_model
+            else tempfile.TemporaryDirectory(prefix="omp-delegate-broker-")
+        )
+        with private as td:
             final_path = Path(td) / "final.json"
             # Persist uncertainty before spawning. A failed birth-record write
             # must never turn consumed work into a replayable pending job.
@@ -1643,6 +1730,16 @@ def _run_request_inner(request: Request, conn: socket.socket) -> dict[str, objec
             stderr = stderr_b.decode(errors="replace")
             final = _valid_final(final_path, caller=request.caller)
             exit_code = process.returncode if process.returncode is not None else 1
+            if request.restricted_model:
+                trace_error = validate_restricted_trace(
+                    final_path.parent / "sessions", request.model)
+                if final is None or final.get("served_model") != request.model:
+                    trace_error = trace_error or "restricted final served_model differs from primary"
+                if trace_error:
+                    final = None
+                    stderr += f"\nomp-delegate-broker: {trace_error}\n"
+                    if exit_code == 0:
+                        exit_code = 69
             outcome = audit_outcome(
                 exit_code, timed_out, group_clear, final, disconnected.is_set(),
             )
