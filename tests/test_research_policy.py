@@ -472,6 +472,29 @@ class ResearchPolicyBrokerTest(unittest.TestCase):
                 "".join(json.dumps(row) + "\n" for row in cases["approved"][0]))
             self.assertIn("exactly one", module.validate_restricted_trace(nested, expected))
 
+    def test_context_artifacts_do_not_hide_additional_model_histories(self) -> None:
+        expected = "openai-codex/gpt-6-sol"
+        rows = [{"type": "session"}, {"type": "model_change", "model": expected},
+                {"type": "message", "message": {
+                    "role": "assistant", "provider": "openai-codex",
+                    "model": "gpt-6-sol"}}]
+        with tempfile.TemporaryDirectory() as td:
+            module = load_broker(_policy(td), td)
+            directory = Path(td) / "session"
+            directory.mkdir()
+            (directory / "primary.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows))
+            context = directory / "local"
+            context.mkdir()
+            (context / "0.read.log").write_text(
+                '{"type":"model_change","model":"untrusted/context-only"}\n')
+            (context / "plan.md").write_text("Private fixture context, not a model run.\n")
+            self.assertIsNone(module.validate_restricted_trace(directory, expected))
+            (context / "child.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows))
+            self.assertIsNotNone(module.validate_restricted_trace(directory, expected))
+
+
     def test_fake_omp_restricted_run_accepts_only_verified_trace(self) -> None:
         expected = "openai-codex/gpt-6-sol"
         primary = [{"type": "session"}, {"type": "model_change", "model": expected},

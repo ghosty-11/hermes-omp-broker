@@ -1182,9 +1182,10 @@ def validate_restricted_trace(directory: Path, expected_model: str) -> str | Non
                     return "restricted session tree contains a symlink"
             for name in files:
                 path = Path(root) / name
-                if path.is_symlink() or not path.is_file() or path.suffix != ".jsonl":
+                if path.is_symlink() or not path.is_file():
                     return "restricted session tree contains an unexpected file"
-                traces.append(path)
+                if path.suffix == ".jsonl":
+                    traces.append(path)
         if len(traces) != 1:
             return "restricted run requires exactly one session trace"
         if traces[0].stat().st_size > 32_000_000:

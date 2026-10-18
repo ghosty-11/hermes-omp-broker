@@ -27,8 +27,10 @@ Restricted runs retain their private session history. Before accepting a
 typed final, the broker requires one complete bounded session trace whose
 model transitions and assistant identities all match the primary. A later
 matching final cannot erase an earlier off-primary span. Missing or invalid
-history fails the job. This check does not grant provider credentials or
-add a model to the resultless-replay inventory.
+history fails the job. Every `*.jsonl` execution history participates in that
+check; bounded regular tool logs and local context files are not model spans.
+Symlinks and special files remain refused. This check does not grant provider
+credentials or add a model to the resultless-replay inventory.
 
 The broker copies the admitted caller name into the child as `OMP_DELEGATE_CALLER`. The
 trusted extension uses that name to choose the tool surface. Callers that do not name a
