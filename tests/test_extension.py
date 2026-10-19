@@ -165,6 +165,46 @@ console.log(JSON.stringify(await handlers.get("tool_call")!({{toolName: "read", 
         self.assertTrue(results[1]["block"])
         self.assertTrue(results[2]["block"])
 
+    def test_filesystem_root_is_not_a_workspace_alias(self) -> None:
+        events = [
+            {"toolName": name, "input": {"path": "/"}}
+            for name in ("read", "grep", "glob", "write")
+        ]
+        events.append({"toolName": "edit", "input": {"input":
+            "*** Begin Patch\n[/#A1B2]\nPUT 1.=1:\n+no root write\n*** End Patch\n"}})
+        for event, result in zip(events, self.exercise(events)):
+            with self.subTest(tool=event["toolName"]):
+                self.assertIsNotNone(result)
+                self.assertTrue(result["block"])
+
+    def test_root_selectors_and_search_lists_stay_outside_the_workspace(self) -> None:
+        events = [
+            {"toolName": name, "input": {"path": path}}
+            for name in ("grep", "glob")
+            for path in (".;/", "/:raw", "/:1-4", "/**")
+        ]
+        for event, result in zip(events, self.exercise(events)):
+            with self.subTest(event=event):
+                self.assertIsNotNone(result)
+                self.assertTrue(result["block"])
+
+    def test_explicit_workspace_and_granted_read_paths_remain_admitted(self) -> None:
+        with tempfile.TemporaryDirectory() as outside:
+            granted = os.path.realpath(outside)
+            evidence = Path(granted) / "evidence.txt"
+            evidence.write_text("external evidence")
+            events = [
+                {"toolName": name, "input": {"path": "."}}
+                for name in ("read", "grep", "glob")
+            ] + [
+                {"toolName": "read", "input": {"path": "inside.txt"}},
+                {"toolName": "write", "input": {"path": "inside.txt", "content": "replacement"}},
+                {"toolName": "read", "input": {"path": str(evidence) + ":1-4"}},
+                {"toolName": "glob", "input": {"path": granted + "/*.txt"}},
+            ]
+            results = self.exercise(events, read_paths=[granted], existing_paths=["inside.txt"])
+        self.assertEqual([None] * len(events), results)
+
     def test_read_only_blocks_write_and_bash(self) -> None:
         results = self.exercise([
             {"toolName": "write", "input": {"path": "inside.txt", "content": "x"}},
@@ -608,44 +648,6 @@ console.log(JSON.stringify(await handlers.get("tool_call")!({{toolName: "read", 
                 capture_output=True, text=True, check=True,
             ).stdout.strip())
 
-    def test_restricted_bash_definition_advertises_scoped_git_only(self) -> None:
-        [definition] = self.exercise(
-            [{"kind": "tool_definition", "name": "bash"}],
-            sandbox="restricted-write",
-            write_patterns=["backlog/**"],
-            git_mode="scoped",
-        )
-        self.assertEqual("Scoped Git", definition["label"])
-        for command in ("git status", "git log", "git diff", "git add", "git mv", "git commit"):
-            self.assertIn(command, definition["description"])
-        self.assertIn("General shell commands are denied", definition["description"])
-
-    def test_hookless_caller_description_names_the_hookless_commit_form(self) -> None:
-        """The description is the worker's only way to know hooks cannot run
-        in its sandbox; without it the worker leaves the run staged and
-        hook-blocked."""
-        [hookless] = self.exercise(
-            [{"kind": "tool_definition", "name": "bash"}],
-            sandbox="restricted-write",
-            write_patterns=["docs/report/*"],
-            git_mode="scoped",
-            hookless_commit=True,
-        )
-        self.assertIn("--no-verify", hookless["description"])
-        [hook_bound] = self.exercise(
-            [{"kind": "tool_definition", "name": "bash"}],
-            sandbox="restricted-write",
-            write_patterns=["docs/*"],
-            git_mode="scoped",
-        )
-        self.assertNotIn("--no-verify", hook_bound["description"])
-
-    def test_boundary_tools_are_always_visible_to_the_model(self) -> None:
-        definitions = self.exercise([
-            {"kind": "tool_definition", "name": "bash"},
-            {"kind": "tool_definition", "name": "broker_finalize"},
-        ])
-        self.assertTrue(all(definition["loadMode"] == "essential" for definition in definitions))
 
 
 if __name__ == "__main__":

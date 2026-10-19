@@ -164,12 +164,12 @@ function withinWorkspace(candidate: string, workspace: string): boolean {
 }
 
 function plainPath(raw: string): string | null {
-  if (raw === "/") return ".";
   if (raw !== raw.trim() || URI_SCHEME.test(raw)) return null;
   const selector = raw.match(SELECTOR);
   const path = selector ? selector[1] : raw;
   if (
-    path.includes(":")
+    path === "/"
+    || path.includes(":")
     || AMBIGUOUS_PATH.test(path)
     || ["~", "@", ":", "[", "'", "\""].some((prefix) => path.startsWith(prefix))
   ) return null;

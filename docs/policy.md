@@ -37,6 +37,12 @@ or MCP. Caller and model authority remain server policy.
 
 `workspace-write` permits the admitted repository. `read-only` denies writes and shell. `restricted-write` admits only relative paths matching configured patterns; shell stays denied unless `git_mode` is `scoped`, which permits bounded status, log, diff, add, and commit operations on those paths. Deployment overlays may add local repositories, identities, and values without modifying reusable package code.
 
+File tools use `.` for the workspace. A literal `/`, including a selector on that
+path, is refused rather than treated as a workspace alias. Absolute paths remain
+admissible beneath the workspace or an explicitly granted read root; a read grant
+does not authorize writes. Search-list members and glob bases must each remain
+within their admitted roots.
+
 ## Caller-specific workspace roots
 
 Use `workspace_roots` when a caller must work in an isolated mirror that does not
