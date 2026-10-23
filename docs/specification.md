@@ -236,6 +236,38 @@ The broker persists a separate lifecycle status such as `completed`, `failed`, `
 result with its before/after Git observations. A model's summary and verification strings
 remain claims; neither the schema nor a `MET` verdict grants authority.
 
+The direct-worker path drains both pipes under one combined 1,000,000-byte limit.
+If it exceeds the limit, neither captured stream is returned or persisted. An
+already-expired deadline remains `timed_out` in the response and job record, with
+a `timeout` audit outcome, even when shutdown output exceeds that limit.
+
+The broker observes direct-worker exit without reaping while it drains pipes,
+closes them, stops the client watcher, and clears surviving members of the
+worker's process group. It reaps the worker before reporting group clearance
+and releasing the workspace lock.
+Clearance requires observed termination of every group member's threads, not
+merely successful signal delivery. A grace-period census is not a termination barrier:
+a member can fork after enumeration starts. Cleanup sends group `SIGKILL` before
+declaring clearance, then observes the group while the unreaped leader still
+pins its identifier. Linux serializes process-group signal traversal with fork
+publication through `tasklist_lock`; a pending fatal signal aborts publication
+([Linux v7.0 signal implementation](https://raw.githubusercontent.com/torvalds/linux/v7.0/kernel/signal.c),
+[fork implementation](https://raw.githubusercontent.com/torvalds/linux/v7.0/kernel/fork.c)).
+
+A zombie leader counts as stopped only when its reported thread count is one;
+otherwise sibling threads can still execute. Missing or malformed thread counts
+also remain unknown.
+
+The census parses raw process-status bytes because process names need not be
+UTF-8 (Unicode Transformation Format, 8-bit). Unreadable status is unknown, not
+clearance. Failed termination or persistently unreadable status can therefore
+delay the response indefinitely, retaining the workspace lock and worker
+identity. On an execution fault, cleanup attempts every pipe close and stops
+the watcher before waiting for termination. A pipe-close failure cannot skip
+another close or replace the execution error. The watcher exits before the
+leader is reaped.
+
+
 Do not return full environment dumps, credential paths, auth snapshots, private SSH configuration, or unbounded session transcripts.
 
 ## Task correlation and independent transports

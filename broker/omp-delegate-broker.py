@@ -12,6 +12,7 @@ import os
 import pwd
 import queue
 import select
+import selectors
 import signal
 import socket
 import stat
@@ -47,6 +48,7 @@ AUDIT_LOG = Path(os.environ.get("HERMES_OMP_AUDIT_LOG", "state/audit.jsonl"))
 MODEL = os.environ.get("HERMES_OMP_MODEL", "provider/model")
 MAX_REQUEST_BYTES = 1_000_000
 MAX_RESPONSE_BYTES = 8_000_000
+MAX_CAPTURE_BYTES = 1_000_000
 MAX_PROMPT_CHARS = 500_000
 MAX_TIMEOUT = 810.0
 ABSOLUTE_MAX_TIMEOUT = 3600.0
@@ -1067,20 +1069,72 @@ def _process_group_exists(pid: int) -> bool:
     return True
 
 
+def _child_exited(pid: int) -> bool:
+    # WNOWAIT keeps the direct child's PID and session pinned through cleanup.
+    return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+
+
+def _running_process_group_exists(pid: int) -> bool:
+    """Observe executing members while an unreaped child pins the group ID."""
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                # comm is arbitrary bytes and can contain spaces or parentheses.
+                fields = (entry / "stat").read_bytes().rsplit(b")", 1)[1].split()
+                if int(fields[2]) == pid:
+                    # A zombie leader can still have executing sibling threads.
+                    if fields[0] not in {b"Z", b"X"} or int(fields[17]) != 1:
+                        return True
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except (OSError, ValueError, IndexError):
+                return True  # Unknown state is not proof that the group stopped.
+    except OSError:
+        return True
+    return False
+
+
+def _close_process_pipes(process, *, suppress_errors=False) -> None:
+    error = None
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+    if error is not None and not suppress_errors:
+        raise error
+
+
 def _kill_process_group(pid: int) -> None:
+    # The owner keeps its direct child unreaped until the watcher and group stop.
     try:
         os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+    except OSError:
+        pass
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
-        if not _process_group_exists(pid):
-            return
+        if not _running_process_group_exists(pid):
+            break
+        if _child_exited(pid):
+            break
         time.sleep(0.02)
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    # A grace census can miss a concurrent fork. Linux serializes group SIGKILL
+    # with fork publication, so establish that barrier before observing clearance.
+    while True:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+            break
+        except ProcessLookupError:
+            return
+        except OSError:
+            time.sleep(0.02)  # Retain ownership until termination can be established.
+    # A signal is not clearance. Keep the workspace and PID pin through cleanup.
+    while _running_process_group_exists(pid):
+        time.sleep(0.02)
 
 
 def _valid_findings(value: object) -> bool:
@@ -1188,9 +1242,11 @@ def audit_outcome(
     exit_code: int, timed_out: bool, group_clear: bool,
     final: dict[str, object] | None, disconnected: bool = False,
 ) -> str:
+    if timed_out:
+        return "timeout"
     if disconnected:
         return "client_disconnected"
-    if exit_code != 0 or timed_out or not group_clear or final is None:
+    if exit_code != 0 or not group_clear or final is None:
         return "failure"
     return str(final["verdict"]).lower().replace(" ", "_")
 
@@ -1592,82 +1648,150 @@ def _run_request_inner(request: Request, conn: socket.socket) -> dict[str, objec
                 JOB_STORE.finish(request_id, "failed", response)
                 return response
 
-            _ACTIVE_PROCESS_GROUP = process.pid
+            watcher = None
+            stop_watcher = None
+            identity = None
             try:
+                identity = _lifecycle.capture_process_identity(process.pid)
+                _ACTIVE_PROCESS_GROUP = process.pid
+                if process.stdin is not None:
+                    process.stdin.close()
+                stop_watcher = threading.Event()
+                disconnected = threading.Event()
                 JOB_STORE.running(request_id, process_group=process.pid)
-            except BaseException:
-                try:
-                    identity = _lifecycle.capture_process_identity(process.pid)
-                    cleared = _lifecycle.terminate_process_tree(
-                        identity, authorize=lambda: True)
-                except (OSError, ValueError, IndexError):
-                    cleared = False
-                if not cleared:
-                    # This Popen has not been reaped: its new session ID cannot
-                    # have been recycled. Never leave anonymous launched work.
+                watcher = threading.Thread(
+                    target=_watch_client_lifetime,
+                    args=(conn, process.pid, stop_watcher, disconnected, request_id),
+                    name=f"omp-client-{request_id}",
+                    daemon=True,
+                )
+                watcher.start()
+                deadline = time.monotonic() + request.timeout
+                buffers = {"stdout": bytearray(), "stderr": bytearray()}
+                timed_out = False
+                exceeded = False
+                with selectors.DefaultSelector() as selector:
+                    for name, stream in (("stdout", process.stdout),
+                                         ("stderr", process.stderr)):
+                        assert stream is not None
+                        selector.register(stream, selectors.EVENT_READ, name)
+                    while selector.get_map():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            if timed_out:
+                                break
+                            if not _child_exited(process.pid):
+                                timed_out = True
+                                _kill_process_group(process.pid)
+                                deadline = time.monotonic() + 1.0
+                                continue
+                            ready = selector.select(0)
+                            if not ready:
+                                break
+                        else:
+                            ready = selector.select(
+                                0 if _child_exited(process.pid) else min(remaining, 0.05))
+                            if not ready and _child_exited(process.pid):
+                                ready = selector.select(0)
+                                if not ready:
+                                    break
+                        for key, _ in ready:
+                            chunk = os.read(key.fileobj.fileno(), 65536)
+                            if not chunk:
+                                selector.unregister(key.fileobj)
+                                continue
+                            if (len(buffers["stdout"]) + len(buffers["stderr"])
+                                    + len(chunk) > MAX_CAPTURE_BYTES):
+                                exceeded = True
+                                break
+                            buffers[key.data].extend(chunk)
+                        if exceeded:
+                            break
+                if exceeded:
                     _kill_process_group(process.pid)
-                process.wait()
-                for stream in (process.stdout, process.stderr):
-                    if stream is not None:
-                        stream.close()
-                raise
-            stop_watcher = threading.Event()
-            disconnected = threading.Event()
-            watcher = threading.Thread(
-                target=_watch_client_lifetime,
-                args=(conn, process.pid, stop_watcher, disconnected, request_id),
-                name=f"omp-client-{request_id}",
-                daemon=True,
-            )
-            watcher.start()
-            timed_out = False
-            try:
-                stdout_b, stderr_b = process.communicate(timeout=request.timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _kill_process_group(process.pid)
-                stdout_b, stderr_b = process.communicate()
-            finally:
+                elif not timed_out:
+                    while not _child_exited(process.pid):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            timed_out = True
+                            _kill_process_group(process.pid)
+                            break
+                        time.sleep(min(remaining, 0.02))
+                _close_process_pipes(process)
                 stop_watcher.set()
-                watcher.join(timeout=3)
+                watcher.join()
                 if watcher.is_alive():
-                    _kill_process_group(process.pid)
-                    watcher.join(timeout=1)
-
-            group_clear = not _process_group_exists(process.pid)
-            if not group_clear:
+                    raise RuntimeError("client watcher did not stop")
                 _kill_process_group(process.pid)
-                group_clear = not _process_group_exists(process.pid)
-            _ACTIVE_PROCESS_GROUP = None
-            stdout = stdout_b.decode(errors="replace")
-            stderr = stderr_b.decode(errors="replace")
-            final = _valid_final(final_path, caller=request.caller)
-            exit_code = process.returncode if process.returncode is not None else 1
-            outcome = audit_outcome(
-                exit_code, timed_out, group_clear, final, disconnected.is_set(),
-            )
-            _audit_safely(
-                request_id=request_id, caller=request.caller, workspace=request.workspace,
-                outcome=outcome, usage={},
-            )
-            response = {
-                "version": request.protocol_version,
-                "exit_code": exit_code,
-                "stdout": stdout,
-                "stderr": stderr,
-                "timed_out": timed_out,
-                "process_group_clear": group_clear,
-                "final": final,
-                "request_id": request_id,
-            }
-            status = (
-                "timed_out" if timed_out
-                else "cancelled" if disconnected.is_set()
-                else "completed" if exit_code == 0 and group_clear and final is not None
-                else "failed"
-            )
-            JOB_STORE.finish(request_id, status, response)
-            return response
+                _ACTIVE_PROCESS_GROUP = None
+                process.wait()
+                group_clear = True
+                if exceeded:
+                    response = _error_response(
+                        "OMP output exceeds capture limit", request_id=request_id,
+                        version=request.protocol_version)
+                    response["timed_out"] = timed_out
+                    response["process_group_clear"] = group_clear
+                    _audit_safely(
+                        request_id=request_id, caller=request.caller,
+                        workspace=request.workspace,
+                        outcome="timeout" if timed_out else "failure", usage={},
+                    )
+                    JOB_STORE.finish(
+                        request_id, "timed_out" if timed_out else "failed", response)
+                    return response
+                stdout = buffers["stdout"].decode(errors="replace")
+                stderr = buffers["stderr"].decode(errors="replace")
+                final = _valid_final(final_path, caller=request.caller)
+                exit_code = process.returncode if process.returncode is not None else 1
+                outcome = audit_outcome(
+                    exit_code, timed_out, group_clear, final, disconnected.is_set(),
+                )
+                _audit_safely(
+                    request_id=request_id, caller=request.caller, workspace=request.workspace,
+                    outcome=outcome, usage={},
+                )
+                response = {
+                    "version": request.protocol_version,
+                    "exit_code": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "timed_out": timed_out,
+                    "process_group_clear": group_clear,
+                    "final": final,
+                    "request_id": request_id,
+                }
+                status = (
+                    "timed_out" if timed_out
+                    else "cancelled" if disconnected.is_set()
+                    else "completed" if exit_code == 0 and group_clear and final is not None
+                    else "failed"
+                )
+                JOB_STORE.finish(request_id, status, response)
+                return response
+            except BaseException:
+                if stop_watcher is not None:
+                    stop_watcher.set()
+                _close_process_pipes(process, suppress_errors=True)
+                if watcher is not None and watcher.ident is not None:
+                    watcher.join()
+                if process.returncode is None:
+                    # waitid also establishes that this remains our unreaped child.
+                    _child_exited(process.pid)
+                    if identity is not None:
+                        try:
+                            child = _lifecycle.process_snapshot(process.pid)
+                            if all(child[key] == identity[key] for key in
+                                   ("pid", "ppid", "pgid", "sid", "start_ticks", "uid")):
+                                _lifecycle.terminate_process_tree(
+                                    identity, authorize=lambda: True)
+                        except (OSError, KeyError, ValueError, IndexError):
+                            pass
+                    # Popen ownership, not optional lifecycle metadata, pins this ID.
+                    _kill_process_group(process.pid)
+                _ACTIVE_PROCESS_GROUP = None
+                process.wait()
+                raise
     finally:
         _ACTIVE_PROCESS_GROUP = None
         lock.close()
